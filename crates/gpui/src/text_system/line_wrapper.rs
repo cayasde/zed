@@ -575,6 +575,17 @@ impl LineWrapper {
             .platform_text_system
             .layout_line(text, self.font_size, runs)
     }
+
+    /// Returns the layout, flattened glyph x positions, and width, with platform-dependent precision.
+    pub fn layout_line_with_precise_positions(
+        &self,
+        text: &str,
+        runs: &[FontRun],
+    ) -> (LineLayout, Vec<f64>, f64) {
+        self.text_system
+            .platform_text_system
+            .layout_line_with_precise_positions(text, self.font_size, runs)
+    }
 }
 
 fn update_runs_after_truncation(

@@ -8,6 +8,7 @@ use collections::HashMap;
 use command_palette::CommandPalette;
 use editor::{
     AnchorRangeExt, DisplayPoint, Editor, EditorMode, MultiBuffer, MultiBufferOffset,
+    SelectionEffects,
     actions::{DeleteLine, WrapSelectionsInTag},
     code_context_menus::CodeContextMenu,
     display_map::DisplayRow,
@@ -48,6 +49,86 @@ async fn test_initially_disabled(cx: &mut gpui::TestAppContext) {
     let mut cx = VimTestContext::new(cx, false).await;
     cx.simulate_keystrokes("h j k l");
     cx.assert_editor_state("hjklˇ");
+}
+
+#[gpui::test]
+async fn test_mode_change_preserves_authoritative_horizontal_positions(cx: &mut TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(settings::SoftWrap::None, cx));
+    let source = format!(
+        "{}{}{}",
+        "x".repeat(100_000),
+        "😀".repeat(8),
+        "x".repeat(100_000)
+    );
+    let destination = "x".repeat(200_050);
+
+    for mode in [Mode::Insert, Mode::Visual] {
+        cx.set_state(&format!("ˇ\nxx\n{destination}"), Mode::Normal);
+        cx.background_executor.set_block_on_ticks(0..=0);
+        let vim = cx.update_editor(|editor, window, cx| {
+            editor.buffer().update(cx, |buffer, cx| {
+                let start = Point::new(0, 0);
+                buffer.edit([(start..start, source.as_str())], None, cx);
+            });
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                let point = Point::new(0, 200_030);
+                selections.select_ranges([point..point]);
+            });
+            editor.addon::<VimAddon>().cloned().expect("vim")
+        });
+        cx.update(|window, cx| {
+            vim.entity.update(cx, |vim, cx| {
+                vim.motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    window,
+                    cx,
+                );
+                vim.update_editor(cx, |_, editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    assert_eq!(
+                        editor.selections.newest::<Point>(&snapshot).head(),
+                        Point::new(1, 1)
+                    );
+                });
+                vim.switch_mode(mode, false, window, cx);
+            });
+        });
+        let frozen = cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).range()
+        });
+        let expected_end = if mode == Mode::Visual { 2 } else { 1 };
+        assert_eq!(frozen, Point::new(1, 1)..Point::new(1, expected_end));
+        cx.background_executor.set_block_on_ticks(0..=50);
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(editor.selections.newest::<Point>(&snapshot).range(), frozen);
+        });
+        cx.update(|window, cx| {
+            vim.entity.update(cx, |vim, cx| {
+                vim.switch_mode(Mode::Normal, false, window, cx);
+                vim.motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(2, 200_014)
+            );
+        });
+    }
 }
 
 #[gpui::test]

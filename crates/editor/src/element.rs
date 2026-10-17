@@ -7,21 +7,21 @@ pub use header::file_status_label_color;
 pub(crate) use header::{header_jump_data, render_buffer_header};
 
 use crate::{
-    BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement, CodeActionSource,
-    ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
-    ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow,
-    EditDisplayMode, EditPrediction, Editor, EditorEvent, EditorMode, EditorSettings,
+    BUFFER_HEADER_PADDING, BlockId, ChunkRenderer, ChunkRendererContext, ChunkReplacement,
+    CodeActionSource, ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs,
+    ConflictsTheirsMarker, ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk,
+    DisplayPoint, DisplayRow, EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings,
     EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown,
     HalfPageUp, HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight,
-    LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt,
-    Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RendererWidthClass, RowExt,
+    RowRangeExt, Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     cursor_animation::{CursorViewport, LogicalCursorPosition, animated_corners_overlap_target},
     display_map::{
         Block, BlockContext, BlockStyle, ChunkRendererId, DisplaySnapshot, EditorMargins,
-        HighlightKey, HighlightedChunk, LongRow, RendererWidthsKey, RowRuns, RowWindow, TextPiece,
-        ToDisplayPoint,
+        HighlightKey, HighlightedChunk, LongRow, RendererWidthsKey, RowMetrics, RowWindow,
+        TextPiece, ToDisplayPoint,
     },
     editor_settings::{
         CurrentLineHighlight, DocumentColorsRenderMode, GitGutterWidth, Minimap, MinimapThumb,
@@ -34,7 +34,7 @@ use crate::{
     },
     inlay_hint_settings,
     scroll::{
-        ActiveScrollbarState, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
+        ActiveScrollbarState, Autoscroll, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
         scroll_amount::ScrollAmount,
     },
 };
@@ -43,16 +43,15 @@ use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
-    Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
-    Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Edges,
-    Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
+    Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, Background,
+    BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
+    Edges, Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
     LineLayout, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, ParentElement, Pixels, ScaledPixels, ScrollHandle, ShapedGlyph, ShapedLine,
-    ShapedRun, SharedString, Size, StatefulInteractiveElement, Style, Styled, StyledText, TaskExt,
-    TextAlign, TextRun, TextStyleRefinement, UnderlineStyle, WeakEntity, Window, div, fill,
-    outline, pattern_slash, point, px, quad, relative, size, solid_background, transparent_black,
-    underline_y_offset,
+    PaintQuad, ParentElement, Pixels, ScaledPixels, ScrollHandle, ShapedLine, SharedString, Size,
+    StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextRun, TextStyle,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, div, fill, outline, pattern_slash,
+    point, px, quad, relative, size, solid_background, transparent_black, underline_y_offset,
 };
 use itertools::Itertools;
 use language::{
@@ -77,11 +76,11 @@ use smallvec::{SmallVec, smallvec};
 use std::{
     any::TypeId,
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::Cell,
     cmp::{self, Ordering},
     fmt::{self, Write},
     iter, mem,
-    ops::{Deref, Range},
+    ops::{ControlFlow, Deref, Range},
     rc::Rc,
     slice,
     sync::Arc,
@@ -926,6 +925,7 @@ impl EditorElement {
             return (selections, active_rows, newest_selection_head);
         };
 
+        let visible_range = start_anchor..end_anchor;
         editor_with_selections.update(cx, |editor, cx| {
             if editor.show_local_selections {
                 let mut layouts = Vec::new();
@@ -1023,7 +1023,6 @@ impl EditorElement {
                 }
 
                 let mut remote_selections = HashMap::default();
-                let visible_range = start_anchor..end_anchor;
                 for selection in snapshot.remote_selections_in_ranges(
                     visible_ranges,
                     &visible_range,
@@ -1063,7 +1062,6 @@ impl EditorElement {
             } else if !editor.is_focused(window) && editor.show_cursor_when_unfocused {
                 let cursor_offset_on_selection = editor.cursor_offset_on_selection;
 
-                let visible_range = start_anchor..end_anchor;
                 let layouts = snapshot
                     .buffer_snapshot()
                     .selections_in_ranges(visible_ranges, &visible_range, true)
@@ -1271,7 +1269,7 @@ impl EditorElement {
                                 cx.theme().colors().editor_background
                             };
 
-                            let shaped = window.text_system().shape_line(
+                            let mut shaped = window.text_system().shape_line(
                                 text,
                                 cursor_row_layout.font_size,
                                 &[TextRun {
@@ -1282,6 +1280,11 @@ impl EditorElement {
                                 }],
                                 None,
                             );
+                            if let Some(metrics) =
+                                cursor_row_layout.text_metrics_for_index(cursor_column)
+                            {
+                                apply_row_metrics(&mut shaped, metrics);
+                            }
                             if !is_ascii_whitespace_only {
                                 block_width = block_width.max(shaped.width);
                             }
@@ -2450,8 +2453,7 @@ impl EditorElement {
 
     fn layout_wrap_guides(
         &self,
-        em_advance: Pixels,
-        scroll_position: gpui::Point<f64>,
+        scroll_left: ScrollPixelOffset,
         content_origin: gpui::Point<Pixels>,
         scrollbar_layout: Option<&EditorScrollbars>,
         vertical_scrollbar_width: Pixels,
@@ -2459,9 +2461,7 @@ impl EditorElement {
         window: &Window,
         cx: &App,
     ) -> SmallVec<[(Pixels, bool); 2]> {
-        let scroll_left = scroll_position.x as f32 * em_advance;
         let content_origin = content_origin.x;
-        let horizontal_offset = content_origin - scroll_left;
         let vertical_scrollbar_width = scrollbar_layout
             .and_then(|layout| layout.visible.then_some(vertical_scrollbar_width))
             .unwrap_or_default();
@@ -2472,7 +2472,8 @@ impl EditorElement {
             .into_iter()
             .flat_map(|(guide, active)| {
                 let wrap_position = column_pixels(&self.style, guide, window);
-                let wrap_guide_x = wrap_position + horizontal_offset;
+                let wrap_guide_x =
+                    content_origin + Pixels::from(f64::from(wrap_position) - scroll_left);
                 let display_wrap_guide = wrap_guide_x >= content_origin
                     && wrap_guide_x <= hitbox.bounds.right() - vertical_scrollbar_width;
 
@@ -3162,6 +3163,8 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         style: &EditorStyle,
         editor_width: Pixels,
+        content_width: Pixels,
+        scroll_x: ScrollPixelOffset,
         long_rows: &[(DisplayRow, LongRow, RowWindow)],
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
         bg_segments_per_row: &[Vec<(Range<DisplayPoint>, Hsla)>],
@@ -3216,29 +3219,23 @@ impl EditorElement {
                 })
                 .collect()
         } else {
-            let use_tree_sitter = !snapshot.semantic_tokens_enabled
-                || snapshot.use_tree_sitter_for_syntax(rows.start, cx);
-            let language_aware = LanguageAwareStyling {
-                tree_sitter: use_tree_sitter,
-                diagnostics: true,
-            };
-            let mut lines = Vec::with_capacity(rows.len());
-            let mut long_rows = long_rows.iter().peekable();
-            let mut short_rows_start = rows.start;
-            for row in (rows.start.0..=rows.end.0).map(DisplayRow) {
-                let long_row = long_rows
-                    .next_if(|(long_row_row, ..)| *long_row_row == row)
-                    .filter(|_| row < rows.end);
-                if row < rows.end && long_row.is_none() {
-                    continue;
-                }
-                if short_rows_start < row {
-                    let offset = short_rows_start.minus(rows.start) as usize;
+            let short_lines = |short_rows: Range<DisplayRow>, window: &mut Window, cx: &mut App| {
+                let mut lines = Vec::with_capacity(short_rows.len());
+                let mut start = short_rows.start;
+                while start < short_rows.end {
+                    let language_aware = language_aware_styling(snapshot, start);
+                    let mut end = start.next_row();
+                    while end < short_rows.end
+                        && language_aware_styling(snapshot, end) == language_aware
+                    {
+                        end = end.next_row();
+                    }
+                    let offset = start.minus(rows.start) as usize;
                     lines.extend(LineWithInvisibles::from_chunks(
-                        snapshot.highlighted_chunks(short_rows_start..row, language_aware, style),
+                        snapshot.highlighted_chunks(start..end, language_aware, style),
                         style,
                         MAX_LINE_LEN,
-                        row.minus(short_rows_start) as usize,
+                        end.minus(start) as usize,
                         &snapshot.mode,
                         editor_width,
                         move |index| is_row_soft_wrapped(index + offset),
@@ -3247,11 +3244,16 @@ impl EditorElement {
                         window,
                         cx,
                     ));
+                    start = end;
                 }
+                lines
+            };
+            let mut lines = Vec::with_capacity(rows.len());
+            let mut short_rows_start = rows.start;
+            for (row, long_row, row_window) in long_rows {
+                let row = *row;
+                lines.extend(short_lines(short_rows_start..row, window, cx));
                 short_rows_start = row.next_row();
-                let Some((_, long_row, row_window)) = long_row else {
-                    continue;
-                };
                 let bg_segments = bg_segments_per_row
                     .get(row.minus(rows.start) as usize)
                     .map_or(&[][..], Vec::as_slice);
@@ -3274,13 +3276,141 @@ impl EditorElement {
                         style,
                         row_window.clone(),
                         editor_width,
+                        content_width,
+                        scroll_x,
                         bg_segments,
                         window,
                         cx,
                     )
                 });
             }
+            lines.extend(short_lines(short_rows_start..rows.end, window, cx));
             lines
+        }
+    }
+
+    fn renderer_widths_key(&self, editor_width: Pixels, window: &Window) -> RendererWidthsKey {
+        RendererWidthsKey {
+            rem_size: window.rem_size(),
+            font: window.text_style().font(),
+            font_size: window.text_style().font_size.to_pixels(window.rem_size()),
+            buffer_font: self.style.text.font(),
+            editor_width,
+            line_height: self.style.text.line_height_in_pixels(window.rem_size()),
+        }
+    }
+
+    fn publish_renderer_widths<'a>(
+        &self,
+        lines: impl IntoIterator<Item = &'a LineWithInvisibles>,
+        editor_width: Pixels,
+        window: &Window,
+        cx: &mut App,
+    ) -> bool {
+        let key = self.renderer_widths_key(editor_width, window);
+        let widths = lines
+            .into_iter()
+            .flat_map(|line| &line.fragments)
+            .filter_map(|fragment| match fragment {
+                LineFragment::Element { id, size, .. } => Some((*id, size.width)),
+                LineFragment::Text(_) => None,
+            });
+        self.editor.update(cx, |editor, cx| {
+            editor.update_renderer_widths(key, widths, cx)
+        })
+    }
+
+    fn measure_unmeasured_renderers(
+        &self,
+        snapshot: &mut EditorSnapshot,
+        editor_width: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let key = self.renderer_widths_key(editor_width, window);
+        let is_stale = self
+            .editor
+            .read(cx)
+            .display_map
+            .read(cx)
+            .renderer_widths_key()
+            != Some(&key);
+        if is_stale
+            && self.editor.update(cx, |editor, cx| {
+                editor.update_renderer_widths(key.clone(), [], cx)
+            })
+        {
+            *snapshot = self
+                .editor
+                .update(cx, |editor, cx| editor.snapshot(window, cx));
+        }
+        let scroll_top = snapshot.scroll_position().y.max(0.).floor() as u32;
+        let visible_rows = self
+            .editor
+            .read(cx)
+            .visible_line_count()
+            .unwrap_or_default()
+            .max(0.)
+            .ceil() as u32;
+        let priority_rows =
+            DisplayRow(scroll_top)..DisplayRow(scroll_top.saturating_add(visible_rows));
+        let mut class_widths = HashMap::<RendererWidthClass, Pixels>::default();
+        let mut widths = Vec::new();
+        let mut budget = PrepaintWorkBudget::new(RENDERER_MEASURE_BUDGET_PER_PREPAINT);
+        window.with_element_namespace("unmeasured_renderers", |window| {
+            snapshot.for_each_unmeasured_renderer(priority_rows, |renderer, text| {
+                if !budget.try_charge(RENDERER_VISIT_COST) {
+                    return ControlFlow::Break(());
+                }
+                let class_width = renderer
+                    .width_class
+                    .as_ref()
+                    .and_then(|class| class_widths.get(class).copied());
+                let width = match class_width {
+                    Some(width) => width,
+                    None => {
+                        if !budget.try_charge(RENDERER_LAYOUT_COST) {
+                            return ControlFlow::Break(());
+                        }
+                        let width = layout_chunk_renderer(
+                            &renderer,
+                            &text,
+                            &self.style.text,
+                            editor_width,
+                            window,
+                            cx,
+                        )
+                        .1
+                        .width;
+                        if let Some(class) = renderer.width_class.clone() {
+                            class_widths.insert(class, width);
+                        }
+                        width
+                    }
+                };
+                widths.push((renderer.id, width));
+                ControlFlow::Continue(())
+            });
+        });
+        if budget.exhausted {
+            window.request_animation_frame();
+        }
+        if !widths.is_empty()
+            && self.editor.update(cx, |editor, cx| {
+                editor.update_renderer_widths(key, widths, cx)
+            })
+        {
+            *snapshot = self
+                .editor
+                .update(cx, |editor, cx| editor.snapshot(window, cx));
+        }
+    }
+
+    fn retain_autoscroll_request(&self, request: Option<(Autoscroll, bool)>, cx: &mut App) {
+        if let Some(request) = request {
+            self.editor.update(cx, |editor, _| {
+                editor.scroll_manager.restore_autoscroll_request(request);
+            });
         }
     }
 
@@ -3318,7 +3448,7 @@ impl EditorElement {
     fn render_block(
         &self,
         block: &Block,
-        mut available_width: AvailableSpace,
+        width: BlockWidth,
         block_id: BlockId,
         block_row_start: DisplayRow,
         snapshot: &EditorSnapshot,
@@ -3333,7 +3463,6 @@ impl EditorElement {
         scroll_width: &mut ScrollPixelOffset,
         resized_blocks: &mut HashMap<CustomBlockId, u32>,
         row_block_types: &mut HashMap<DisplayRow, bool>,
-        selections: &[Selection<Point>],
         selected_buffer_ids: &Vec<BufferId>,
         latest_selection_anchors: &HashMap<BufferId, Anchor>,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
@@ -3351,10 +3480,10 @@ impl EditorElement {
     )> {
         let mut x_position = None;
         let mut coordinate_base: ScrollPixelOffset = 0.;
+        let mut available_width = width.rebased(coordinate_base);
         let mut element = match block {
             Block::Custom(custom) => {
                 let block_start = custom.start().to_point(&snapshot.buffer_snapshot());
-                let block_end = custom.end().to_point(&snapshot.buffer_snapshot());
                 if block.place_near() && snapshot.is_line_folded(MultiBufferRow(block_start.row)) {
                     return None;
                 }
@@ -3385,22 +3514,18 @@ impl EditorElement {
 
                 if block.style() == BlockStyle::FlexWithAnchor && !block.place_near() {
                     coordinate_base = (custom_block_x_position.0 - BLOCK_COORDINATE_MARGIN).max(0.);
-                    available_width = rebased_block_width(available_width, coordinate_base);
+                    available_width = width.rebased(coordinate_base);
                 }
                 let anchor_x = Pixels::from(custom_block_x_position.0 - coordinate_base);
                 x_position = Some(custom_block_x_position);
 
-                let selected = selections
-                    .binary_search_by(|selection| {
-                        if selection.end <= block_start {
-                            Ordering::Less
-                        } else if selection.start >= block_end {
-                            Ordering::Greater
-                        } else {
-                            Ordering::Equal
-                        }
-                    })
-                    .is_ok();
+                let block_range = custom.start()..custom.end();
+                let selected = self.editor_with_selections(cx).is_some_and(|editor| {
+                    editor
+                        .read(cx)
+                        .selections
+                        .overlaps_range(&block_range, snapshot)
+                });
 
                 div()
                     .size_full()
@@ -3415,10 +3540,8 @@ impl EditorElement {
                             block_id,
                             height: custom.height.unwrap_or(1),
                             selected,
-                            max_width: text_hitbox
-                                .size
-                                .width
-                                .max(Pixels::from(*scroll_width - coordinate_base)),
+                            max_width: ScrollPixelOffset::from(text_hitbox.size.width)
+                                .max(*scroll_width - coordinate_base),
                             editor_style: &self.style,
                             indent_guide_padding: indent_guides
                                 .as_ref()
@@ -3630,6 +3753,18 @@ impl EditorElement {
         }
     }
 
+    fn spacer_background(line_height: Pixels, window: &Window, cx: &App) -> Background {
+        let target_size = 16.0;
+        let scale = window.scale_factor();
+        let pattern_size =
+            Self::spacer_pattern_period(f32::from(line_height) * scale, target_size * scale);
+        pattern_slash(
+            cx.theme().colors().panel_background,
+            2.0,
+            pattern_size - 2.0,
+        )
+    }
+
     pub fn render_spacer_block(
         block_id: BlockId,
         block_height: u32,
@@ -3638,12 +3773,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &App,
     ) -> AnyElement {
-        let target_size = 16.0;
-        let scale = window.scale_factor();
-        let pattern_size =
-            Self::spacer_pattern_period(f32::from(line_height) * scale, target_size * scale);
-        let color = cx.theme().colors().panel_background;
-        let background = pattern_slash(color, 2.0, pattern_size - 2.0);
+        let background = Self::spacer_background(line_height, window, cx);
 
         div()
             .id(block_id)
@@ -3685,7 +3815,6 @@ impl EditorElement {
         text_x: Pixels,
         line_height: Pixels,
         line_layouts: &[LineWithInvisibles],
-        selections: &[Selection<Point>],
         selected_buffer_ids: &Vec<BufferId>,
         latest_selection_anchors: &HashMap<BufferId, Anchor>,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
@@ -3717,7 +3846,7 @@ impl EditorElement {
 
             if let Some((element, element_size, row, x_offset, _)) = self.render_block(
                 block,
-                AvailableSpace::MinContent,
+                BlockWidth::MinContent,
                 block_id,
                 row,
                 snapshot,
@@ -3732,7 +3861,6 @@ impl EditorElement {
                 scroll_width,
                 &mut resized_blocks,
                 &mut row_block_types,
-                selections,
                 selected_buffer_ids,
                 latest_selection_anchors,
                 is_row_soft_wrapped,
@@ -3756,27 +3884,24 @@ impl EditorElement {
             }
         }
 
+        let content_width = |scroll_width: ScrollPixelOffset, leading: Pixels| {
+            BlockWidth::Definite(
+                ScrollPixelOffset::from(hitbox.size.width.max(fixed_block_max_width)).max(
+                    ScrollPixelOffset::from(leading + editor_margins.extended_right) + scroll_width,
+                ),
+            )
+        };
         for (row, block) in non_fixed_blocks {
             let style = block.style();
             let width = match (style, block.place_near()) {
-                (_, true) => AvailableSpace::MinContent,
-                (BlockStyle::Sticky, _) => hitbox.size.width.into(),
-                (BlockStyle::Flex | BlockStyle::FlexWithAnchor, _) => hitbox
-                    .size
-                    .width
-                    .max(fixed_block_max_width)
-                    .max(
-                        editor_margins.gutter.width
-                            + Pixels::from(*scroll_width)
-                            + editor_margins.extended_right,
-                    )
-                    .into(),
-                (BlockStyle::Spacer, _) => hitbox
-                    .size
-                    .width
-                    .max(fixed_block_max_width)
-                    .max(Pixels::from(*scroll_width) + editor_margins.extended_right)
-                    .into(),
+                (_, true) => BlockWidth::MinContent,
+                (BlockStyle::Sticky, _) => {
+                    BlockWidth::Definite(ScrollPixelOffset::from(hitbox.size.width))
+                }
+                (BlockStyle::Flex | BlockStyle::FlexWithAnchor, _) => {
+                    content_width(*scroll_width, editor_margins.gutter.width)
+                }
+                (BlockStyle::Spacer, _) => content_width(*scroll_width, Pixels::ZERO),
                 (BlockStyle::Fixed, _) => unreachable!(),
             };
             let block_id = block.id();
@@ -3802,7 +3927,6 @@ impl EditorElement {
                 scroll_width,
                 &mut resized_blocks,
                 &mut row_block_types,
-                selections,
                 selected_buffer_ids,
                 latest_selection_anchors,
                 is_row_soft_wrapped,
@@ -3837,22 +3961,14 @@ impl EditorElement {
         {
             let style = block.style();
             let width = match style {
-                BlockStyle::Fixed => AvailableSpace::MinContent,
+                BlockStyle::Fixed => BlockWidth::MinContent,
                 BlockStyle::Flex | BlockStyle::FlexWithAnchor => {
-                    AvailableSpace::Definite(hitbox.size.width.max(fixed_block_max_width).max(
-                        editor_margins.gutter.width
-                            + Pixels::from(*scroll_width)
-                            + editor_margins.extended_right,
-                    ))
+                    content_width(*scroll_width, editor_margins.gutter.width)
                 }
-                BlockStyle::Spacer => AvailableSpace::Definite(
-                    hitbox
-                        .size
-                        .width
-                        .max(fixed_block_max_width)
-                        .max(Pixels::from(*scroll_width) + editor_margins.extended_right),
-                ),
-                BlockStyle::Sticky => AvailableSpace::Definite(hitbox.size.width),
+                BlockStyle::Spacer => content_width(*scroll_width, Pixels::ZERO),
+                BlockStyle::Sticky => {
+                    BlockWidth::Definite(ScrollPixelOffset::from(hitbox.size.width))
+                }
             };
 
             if let Some((element, element_size, _, x_offset, width)) = self.render_block(
@@ -3872,7 +3988,6 @@ impl EditorElement {
                 scroll_width,
                 &mut resized_blocks,
                 &mut row_block_types,
-                selections,
                 selected_buffer_ids,
                 latest_selection_anchors,
                 is_row_soft_wrapped,
@@ -7439,74 +7554,31 @@ pub(crate) struct LineWithInvisibles {
 struct LongRowWindow {
     row: LongRow,
     plan: RowWindow,
-    segments: SmallVec<[WindowSegment; 1]>,
+    origin_x: ScrollPixelOffset,
     fragment_origins: SmallVec<[(usize, ScrollPixelOffset); 1]>,
-}
-
-struct WindowSegment {
-    columns: Range<usize>,
-    atom_positions: Vec<(u32, ScrollPixelOffset)>,
 }
 
 impl LongRowWindow {
     fn contains_column(&self, column: usize) -> bool {
-        self.segments
-            .iter()
-            .any(|segment| segment.columns.start <= column && column <= segment.columns.end)
-    }
-
-    fn end_x(&self) -> ScrollPixelOffset {
-        self.segments
-            .last()
-            .and_then(|segment| segment.atom_positions.last())
-            .map_or(0., |(_, x)| *x)
+        let segments = self.plan.segments();
+        let index = segments.partition_point(|segment| (segment.end as usize) < column);
+        segments
+            .get(index)
+            .is_some_and(|segment| segment.start as usize <= column)
     }
 
     fn x_for_index(&self, index: usize) -> ScrollPixelOffset {
         let Ok(column) = u32::try_from(index) else {
             return self.row.width();
         };
-        self.segments
-            .iter()
-            .find_map(|segment| segment.x_for_column(column))
-            .unwrap_or_else(|| self.row.x_for_column(column))
+        self.row.x_for_column(column)
     }
 
     fn index_for_x(&self, x: ScrollPixelOffset) -> Option<usize> {
         if x >= self.row.width() {
             return None;
         }
-        let column = self
-            .segments
-            .iter()
-            .find_map(|segment| segment.column_at_x(x))
-            .unwrap_or_else(|| self.row.column_at_x(x));
-        Some(column as usize)
-    }
-}
-
-impl WindowSegment {
-    fn x_for_column(&self, column: u32) -> Option<ScrollPixelOffset> {
-        if !self.columns.contains(&(column as usize)) && self.columns.end != column as usize {
-            return None;
-        }
-        let index = self
-            .atom_positions
-            .partition_point(|(atom_start, _)| *atom_start < column);
-        self.atom_positions.get(index).map(|(_, x)| *x)
-    }
-
-    fn column_at_x(&self, x: ScrollPixelOffset) -> Option<u32> {
-        let (_, start_x) = self.atom_positions.first()?;
-        let (_, end_x) = self.atom_positions.last()?;
-        if x < *start_x || x >= *end_x {
-            return None;
-        }
-        let index = self
-            .atom_positions
-            .partition_point(|(_, atom_x)| *atom_x <= x);
-        let (column, _) = self.atom_positions.get(index.checked_sub(1)?)?;
-        Some(*column)
+        Some(self.row.column_at_x(x) as usize)
     }
 }
 
@@ -7565,17 +7637,21 @@ impl LineWithInvisibles {
         style: &EditorStyle,
         row_window: RowWindow,
         editor_width: Pixels,
+        content_width: Pixels,
+        scroll_x: ScrollPixelOffset,
         bg_segments: &[(Range<DisplayPoint>, Hsla)],
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
-        let language_aware = long_row_language_aware(snapshot, row, cx);
+        let language_aware = language_aware_styling(snapshot, row);
         let mut line = Self {
+            width: long_row.width(),
             font_size: style.text.font_size.to_pixels(window.rem_size()),
             ..Self::default()
         };
-        let mut segments = SmallVec::new();
+        let origin_x = -line.origin_x(style.text.text_align, content_width, scroll_x);
         let mut fragment_origins = SmallVec::new();
+        let metrics = long_row.metrics();
         for columns in row_window.segments() {
             let start = columns.start as usize;
             let end = columns.end as usize;
@@ -7586,12 +7662,9 @@ impl LineWithInvisibles {
                 .iter()
                 .map(|(range, color)| (shift(range.start)..shift(range.end), *color))
                 .collect::<Vec<_>>();
-            let atom_positions = long_row.atom_positions(columns.clone());
             let text = LongRowText {
                 start,
-                pieces: long_row.text_pieces(columns.clone()),
-                atom_positions: &atom_positions,
-                origins: RefCell::default(),
+                pieces: long_row.window_layout(columns.clone(), origin_x),
             };
             let chunks =
                 snapshot.highlighted_chunks_in_row(row, columns.clone(), language_aware, style);
@@ -7612,19 +7685,27 @@ impl LineWithInvisibles {
             .unwrap_or_default();
 
             let Self {
-                fragments,
+                mut fragments,
                 mut invisibles,
                 diagnostic_underline_severity_ranges,
                 ..
             } = part;
-            let origins = text.origins.into_inner();
+            for fragment in &mut fragments {
+                if let LineFragment::Text(line) = fragment {
+                    apply_row_metrics(line, metrics);
+                }
+            }
+            let mut pieces = text.pieces.iter().peekable();
             let mut fragment_start = start;
             for fragment in &fragments {
-                let origin = match fragment {
-                    LineFragment::Text(_) => origins.get(&fragment_start).copied(),
-                    LineFragment::Element { .. } => None,
-                }
-                .unwrap_or_else(|| atom_x(&atom_positions, fragment_start));
+                let origin = if let LineFragment::Text(_) = fragment
+                    && let Some(piece) =
+                        pieces.next_if(|piece| piece.columns.start as usize == fragment_start)
+                {
+                    piece.x
+                } else {
+                    long_row.x_for_column(fragment_start as u32)
+                };
                 fragment_origins.push((fragment_start, origin));
                 fragment_start += fragment.len();
             }
@@ -7656,17 +7737,12 @@ impl LineWithInvisibles {
                     .map(|(range, severity)| (range.start + start..range.end + start, severity)),
             );
             line.fragments.extend(fragments);
-            segments.push(WindowSegment {
-                columns: start..end,
-                atom_positions,
-            });
         }
         line.len = long_row.len() as usize;
-        line.width = long_row.width();
         line.long_row = Some(LongRowWindow {
             row: long_row,
             plan: row_window,
-            segments,
+            origin_x,
             fragment_origins,
         });
         line
@@ -7682,7 +7758,7 @@ impl LineWithInvisibles {
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
-        let language_aware = long_row_language_aware(snapshot, row, cx);
+        let language_aware = language_aware_styling(snapshot, row);
         Self::from_chunks(
             snapshot.highlighted_chunks_in_row(row, 0..end, language_aware, style),
             style,
@@ -7704,38 +7780,24 @@ impl LineWithInvisibles {
         &self,
         scroll_x: ScrollPixelOffset,
         text_align: TextAlign,
-        editor_width: Pixels,
-    ) -> Option<(LongRow, RowWindow, bool)> {
+        gutter_margin: Pixels,
+        content_width: Pixels,
+    ) -> Option<(LongRow, RowWindow)> {
         let window = self.long_row.as_ref()?;
-        let plan = window.row.chunk_aligned(&window.row.window(
-            scroll_x,
+        let plan = window.row.visible_window(
+            scroll_x - f64::from(gutter_margin),
             text_align,
-            f64::from(editor_width),
-        ));
-        if plan == window.plan {
-            return None;
-        }
-        let covered = plan.segments().iter().all(|segment| {
-            window
-                .plan
-                .segments()
-                .iter()
-                .any(|current| current.start <= segment.start && segment.end <= current.end)
-        });
-        Some((window.row.clone(), plan, covered))
-    }
-
-    fn long_row_extent(&self) -> Option<ScrollPixelOffset> {
-        let window = self.long_row.as_ref()?;
-        let reaches_row_end = window
-            .segments
-            .last()
-            .is_some_and(|segment| segment.columns.end >= self.len);
-        Some(if reaches_row_end {
-            self.width.max(window.end_x())
-        } else {
-            self.width
-        })
+            f64::from(content_width),
+        );
+        let covered = window.origin_x == -self.origin_x(text_align, content_width, scroll_x)
+            && plan.segments().iter().all(|segment| {
+                window
+                    .plan
+                    .segments()
+                    .iter()
+                    .any(|current| current.start <= segment.start && segment.end <= current.end)
+            });
+        (!covered).then(|| (window.row.clone(), plan))
     }
 
     fn fragment_positions(
@@ -7758,24 +7820,6 @@ impl LineWithInvisibles {
             })
     }
 
-    fn is_provisional(&self) -> bool {
-        self.long_row
-            .as_ref()
-            .is_some_and(|window| !window.row.is_measured())
-    }
-
-    fn end_x(&self) -> ScrollPixelOffset {
-        match &self.long_row {
-            Some(window) => window.end_x(),
-            None => self
-                .fragment_positions()
-                .last()
-                .map_or(0., |(fragment, _, x)| {
-                    x + ScrollPixelOffset::from(fragment.width())
-                }),
-        }
-    }
-
     fn from_chunks<'a>(
         chunks: impl Iterator<Item = HighlightedChunk<'a>>,
         editor_style: &EditorStyle,
@@ -7785,7 +7829,7 @@ impl LineWithInvisibles {
         text_width: Pixels,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
         bg_segments_per_row: &[Vec<(Range<DisplayPoint>, Hsla)>],
-        long_row: Option<&LongRowText<'_>>,
+        long_row: Option<&LongRowText>,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<Self> {
@@ -7808,8 +7852,6 @@ impl LineWithInvisibles {
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let min_contrast = EditorSettings::get_global(cx).minimum_contrast_for_highlights;
 
-        let ellipsis = SharedString::from("⋯");
-
         for highlighted_chunk in chunks.chain([HighlightedChunk {
             text: "\n",
             style: None,
@@ -7830,13 +7872,9 @@ impl LineWithInvisibles {
 
                 if !line.is_empty() {
                     let segments = bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]);
-                    let text_runs: &[TextRun] = if segments.is_empty() {
-                        &styles
-                    } else {
-                        &Self::split_runs_by_bg_segments(&styles, segments, min_contrast, len)
-                    };
+                    let decorations = Decorations::new(&styles, segments, min_contrast);
                     for shaped_line in
-                        shape_text_fragment(&line, len, text_runs, long_row, font_size, window)
+                        shape_text_fragment(&line, len, &decorations, long_row, font_size, window)
                     {
                         width += shaped_line.width;
                         len += shaped_line.len;
@@ -7860,31 +7898,11 @@ impl LineWithInvisibles {
                             line_byte_offset += highlighted_chunk.text.len();
                             continue;
                         }
-                        let available_width = if renderer.constrain_width {
-                            let chunk = if highlighted_chunk.text == ellipsis.as_ref() {
-                                ellipsis.clone()
-                            } else {
-                                SharedString::from(Arc::from(highlighted_chunk.text))
-                            };
-                            let shaped_line = window.text_system().shape_line(
-                                chunk,
-                                font_size,
-                                &[text_style.to_run(highlighted_chunk.text.len())],
-                                None,
-                            );
-                            AvailableSpace::Definite(shaped_line.width)
-                        } else {
-                            AvailableSpace::MinContent
-                        };
-
-                        let mut element = (renderer.render)(&mut ChunkRendererContext {
-                            context: cx,
-                            window,
-                            max_width: text_width,
-                        });
-                        let line_height = text_style.line_height_in_pixels(window.rem_size());
-                        let size = element.layout_as_root(
-                            size(available_width, AvailableSpace::Definite(line_height)),
+                        let (element, size) = layout_chunk_renderer(
+                            &renderer,
+                            highlighted_chunk.text,
+                            text_style,
+                            text_width,
                             window,
                             cx,
                         );
@@ -7936,14 +7954,15 @@ impl LineWithInvisibles {
                 for (ix, mut line_chunk) in highlighted_chunk.text.split('\n').enumerate() {
                     if ix > 0 {
                         let segments = bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]);
-                        let text_runs = if segments.is_empty() {
-                            &styles
-                        } else {
-                            &Self::split_runs_by_bg_segments(&styles, segments, min_contrast, len)
-                        };
-                        for shaped_line in
-                            shape_text_fragment(&line, len, text_runs, long_row, font_size, window)
-                        {
+                        let decorations = Decorations::new(&styles, segments, min_contrast);
+                        for shaped_line in shape_text_fragment(
+                            &line,
+                            len,
+                            &decorations,
+                            long_row,
+                            font_size,
+                            window,
+                        ) {
                             width += shaped_line.width;
                             len += shaped_line.len;
                             fragments.push(LineFragment::Text(shaped_line));
@@ -8252,18 +8271,22 @@ impl LineWithInvisibles {
         let mut underlines = SmallVec::<[DiagnosticUnderline; 4]>::new();
         let mut diagnostic_ranges = self.diagnostic_underline_severity_ranges.iter().peekable();
         let mut end_underline_offset = layout.point_diagnostic_underline_offset;
+        let column_underline =
+            |diagnostic: &PointDiagnostic, underline_offset: Pixels, window: &Window| {
+                let x = origin_x + self.x_for_index(diagnostic.column as usize);
+                DiagnosticUnderline::point(
+                    diagnostic,
+                    content_origin + point(Pixels::from(x), line_y + underline_offset),
+                    layout.position_map.em_advance,
+                    window,
+                )
+            };
 
         for (fragment, fragment_start, fragment_x) in self.fragment_positions() {
             while let Some(diagnostic) =
                 points.next_if(|diagnostic| (diagnostic.column as usize) < fragment_start)
             {
-                let x = origin_x + self.x_for_index(diagnostic.column as usize);
-                underlines.push(DiagnosticUnderline::point(
-                    diagnostic,
-                    content_origin + point(Pixels::from(x), line_y + end_underline_offset),
-                    layout.position_map.em_advance,
-                    window,
-                ));
+                underlines.push(column_underline(diagnostic, end_underline_offset, window));
             }
             let fragment_origin =
                 content_origin + point(Pixels::from(origin_x + fragment_x), line_y);
@@ -8421,14 +8444,8 @@ impl LineWithInvisibles {
                 }
             }
         }
-        let end_origin = content_origin + point(Pixels::from(origin_x + self.end_x()), line_y);
         for diagnostic in points {
-            underlines.push(DiagnosticUnderline::point(
-                diagnostic,
-                end_origin + point(Pixels::ZERO, end_underline_offset),
-                layout.position_map.em_advance,
-                window,
-            ));
+            underlines.push(column_underline(diagnostic, end_underline_offset, window));
         }
 
         self.draw_invisibles(
@@ -8488,7 +8505,11 @@ impl LineWithInvisibles {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let alignment_offset = self.alignment_offset(layout.text_align, layout.content_width);
+        let origin_x = self.origin_x(
+            layout.text_align,
+            layout.content_width,
+            layout.position_map.scroll_pixel_position.x,
+        );
         let extract_whitespace_info = |invisible: &Invisible| {
             let (token_offset, token_end_offset, invisible_symbol) = match invisible {
                 Invisible::Tab {
@@ -8513,14 +8534,8 @@ impl LineWithInvisibles {
             let invisible_offset = ScrollPixelOffset::from(
                 (glyph_width - invisible_symbol.width).max(Pixels::ZERO) / 2.0,
             );
-            let origin = content_origin
-                + point(
-                    Pixels::from(
-                        alignment_offset + token_x + invisible_offset
-                            - layout.position_map.scroll_pixel_position.x,
-                    ),
-                    line_y,
-                );
+            let origin =
+                content_origin + point(Pixels::from(origin_x + token_x + invisible_offset), line_y);
 
             (
                 [token_offset, token_end_offset],
@@ -8630,7 +8645,7 @@ impl LineWithInvisibles {
                 };
             }
         }
-        self.end_x()
+        self.width
     }
 
     pub fn index_for_x(&self, x: ScrollPixelOffset) -> Option<usize> {
@@ -8665,6 +8680,18 @@ impl LineWithInvisibles {
             }
         }
         None
+    }
+
+    fn text_metrics_for_index(&self, index: usize) -> Option<RowMetrics> {
+        self.fragment_positions()
+            .find(|(fragment, fragment_start, _)| index < fragment_start + fragment.len())
+            .and_then(|(fragment, _, _)| match fragment {
+                LineFragment::Text(shaped_line) => Some(RowMetrics {
+                    ascent: shaped_line.ascent,
+                    descent: shaped_line.descent,
+                }),
+                LineFragment::Element { .. } => None,
+            })
     }
 
     pub fn alignment_offset(
@@ -8765,23 +8792,6 @@ fn horizontal_scroll_anchor(
         .or_else(|| (0..line_layouts.len()).find_map(left_edge))
 }
 
-fn clip_ranges_to_row_windows<T>(
-    items: &mut Vec<T>,
-    range: impl Fn(&mut T) -> &mut Range<DisplayPoint>,
-    long_rows: &[(DisplayRow, LongRow, RowWindow)],
-) {
-    if long_rows.is_empty() {
-        return;
-    }
-    clip_ranges_to_columns(items, range, |row| {
-        let index = long_rows
-            .binary_search_by_key(&row, |(long_row_row, ..)| *long_row_row)
-            .ok()?;
-        let segments = long_rows[index].2.segments();
-        Some(segments.first()?.start..segments.last()?.end)
-    });
-}
-
 fn clip_ranges_to_columns<T>(
     items: &mut Vec<T>,
     range: impl Fn(&mut T) -> &mut Range<DisplayPoint>,
@@ -8815,133 +8825,184 @@ fn clip_ranges_to_columns<T>(
     });
 }
 
-fn long_row_language_aware(
-    snapshot: &EditorSnapshot,
-    row: DisplayRow,
-    cx: &mut App,
-) -> LanguageAwareStyling {
-    LanguageAwareStyling {
-        tree_sitter: !snapshot.semantic_tokens_enabled
-            || snapshot.use_tree_sitter_for_syntax(row, cx),
-        diagnostics: true,
+fn language_aware_styling(snapshot: &EditorSnapshot, row: DisplayRow) -> LanguageAwareStyling {
+    snapshot
+        .display_snapshot
+        .language_aware_styling(row, &snapshot.syntax)
+}
+
+struct Decorations<'a> {
+    styles: &'a [TextRun],
+    style_ends: Vec<usize>,
+    bg_segments: &'a [(Range<DisplayPoint>, Hsla)],
+    min_contrast: f32,
+}
+
+impl<'a> Decorations<'a> {
+    fn new(
+        styles: &'a [TextRun],
+        bg_segments: &'a [(Range<DisplayPoint>, Hsla)],
+        min_contrast: f32,
+    ) -> Self {
+        let style_ends = styles
+            .iter()
+            .scan(0, |end, run| {
+                *end += run.len;
+                Some(*end)
+            })
+            .collect();
+        Self {
+            styles,
+            style_ends,
+            bg_segments,
+            min_contrast,
+        }
+    }
+
+    fn styles_in(&self, range: Range<usize>) -> Vec<TextRun> {
+        let first = self.style_ends.partition_point(|end| *end <= range.start);
+        let mut run_start = first
+            .checked_sub(1)
+            .map_or(0, |previous| self.style_ends[previous]);
+        let mut sliced = Vec::new();
+        for run in &self.styles[first..] {
+            if run_start >= range.end {
+                break;
+            }
+            let run_end = run_start + run.len;
+            let start = run_start.max(range.start);
+            let end = run_end.min(range.end);
+            if start < end {
+                sliced.push(TextRun {
+                    len: end - start,
+                    ..run.clone()
+                });
+            }
+            run_start = run_end;
+        }
+        sliced
+    }
+
+    fn bg_segments_in(&self, columns: Range<usize>) -> &'a [(Range<DisplayPoint>, Hsla)] {
+        let first = self
+            .bg_segments
+            .partition_point(|(range, _)| range.end.column() as usize <= columns.start);
+        let len = self.bg_segments[first..]
+            .partition_point(|(range, _)| (range.start.column() as usize) < columns.end);
+        &self.bg_segments[first..first + len]
+    }
+
+    fn runs(&self, range: Range<usize>, offset: usize, glyphs: &LineLayout) -> Vec<TextRun> {
+        let styles = self.styles_in(range.clone());
+        let start = offset + range.start;
+        let bg_segments = self.bg_segments_in(start..offset + range.end);
+        if bg_segments.is_empty() {
+            return styles;
+        }
+        let bg_segments = glyph_aligned_bg_segments(bg_segments, glyphs, start);
+        LineWithInvisibles::split_runs_by_bg_segments(
+            &styles,
+            &bg_segments,
+            self.min_contrast,
+            start,
+        )
     }
 }
 
-fn long_row_shaping_runs(
-    snapshot: &EditorSnapshot,
-    row: DisplayRow,
-    row_window: &RowWindow,
-    style: &EditorStyle,
-    window: &Window,
-    cx: &mut App,
-) -> SmallVec<[RowRuns; 1]> {
-    let language_aware = long_row_language_aware(snapshot, row, cx);
-    row_window
-        .segments()
+fn glyph_aligned_bg_segments(
+    bg_segments: &[(Range<DisplayPoint>, Hsla)],
+    line: &LineLayout,
+    start_col_offset: usize,
+) -> Vec<(Range<DisplayPoint>, Hsla)> {
+    let mut glyph_starts = line
+        .runs
         .iter()
-        .map(|columns| {
-            let text_runs = snapshot
-                .highlighted_chunks_in_row(row, columns.clone(), language_aware, style)
-                .map(|chunk| match chunk.style {
-                    Some(highlight) => style
-                        .text
-                        .clone()
-                        .highlight(highlight)
-                        .to_run(chunk.text.len()),
-                    None => style.text.to_run(chunk.text.len()),
-                })
-                .collect::<Vec<_>>();
-            RowRuns::new(columns.start, window.text_system().font_runs(&text_runs))
+        .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+        .collect::<Vec<_>>();
+    glyph_starts.sort_unstable();
+    let line_end = start_col_offset + line.len;
+    let is_inside = |column: usize| start_col_offset < column && column < line_end;
+    let snap_start = |column: usize| {
+        if !is_inside(column) {
+            return column;
+        }
+        let local = column - start_col_offset;
+        let ix = glyph_starts.partition_point(|start| *start <= local);
+        start_col_offset + ix.checked_sub(1).map_or(0, |ix| glyph_starts[ix])
+    };
+    let snap_end = |column: usize| {
+        if !is_inside(column) {
+            return column;
+        }
+        let local = column - start_col_offset;
+        let ix = glyph_starts.partition_point(|start| *start < local);
+        start_col_offset + glyph_starts.get(ix).copied().unwrap_or(line.len)
+    };
+    let mut previous_end = 0;
+    bg_segments
+        .iter()
+        .filter_map(|(range, color)| {
+            let start = snap_start(range.start.column() as usize).max(previous_end);
+            let end = snap_end(range.end.column() as usize);
+            if start >= end {
+                return None;
+            }
+            previous_end = end;
+            Some((
+                DisplayPoint::new(range.start.row(), start as u32)
+                    ..DisplayPoint::new(range.end.row(), end as u32),
+                *color,
+            ))
         })
         .collect()
 }
 
-struct LongRowText<'a> {
+struct LongRowText {
     start: usize,
     pieces: Vec<TextPiece>,
-    atom_positions: &'a [(u32, ScrollPixelOffset)],
-    origins: RefCell<HashMap<usize, ScrollPixelOffset>>,
 }
 
-impl LongRowText<'_> {
+impl LongRowText {
     fn shape(
         &self,
         text: &str,
         offset: usize,
-        runs: &[TextRun],
-        font_size: Pixels,
-        window: &mut Window,
+        decorations: &Decorations<'_>,
+        window: &Window,
     ) -> SmallVec<[ShapedLine; 1]> {
         let fragment_start = self.start + offset;
         let fragment_end = fragment_start + text.len();
         let mut shaped = SmallVec::new();
         let mut cursor = fragment_start;
-        for piece in &self.pieces {
+        let first = self
+            .pieces
+            .partition_point(|piece| (piece.columns.start as usize) < fragment_start);
+        for piece in &self.pieces[first..] {
             let piece_start = piece.columns.start as usize;
             let piece_end = piece.columns.end as usize;
-            if piece_start < cursor || piece_end > fragment_end {
-                continue;
+            if piece_start >= fragment_end {
+                break;
             }
+            debug_assert_eq!(piece_start, cursor);
+            debug_assert!(piece_end <= fragment_end);
             let local = piece_start - fragment_start..piece_end - fragment_start;
-            if text.get(local.clone()) != Some(piece.text.as_str()) {
-                continue;
-            }
-            if cursor < piece_start {
-                shaped.push(self.fallback(
-                    text,
-                    fragment_start,
-                    cursor..piece_start,
-                    runs,
-                    font_size,
-                    window,
-                ));
-            }
-            self.origins.borrow_mut().insert(piece_start, piece.x);
+            debug_assert_eq!(text.get(local.clone()), Some(piece.text.as_str()));
+            debug_assert!(
+                piece.is_shaped_with(
+                    window
+                        .text_system()
+                        .font_runs(&decorations.styles_in(local.clone()))
+                )
+            );
+            let runs = decorations.runs(local, offset, &piece.layout);
             shaped.push(ShapedLine::new(
                 piece.layout.clone(),
-                SharedString::new(&text[local.clone()]),
-                &slice_runs(runs, local),
+                piece.text.clone(),
+                &runs,
             ));
             cursor = piece_end;
         }
-        if cursor < fragment_end || shaped.is_empty() {
-            shaped.push(self.fallback(
-                text,
-                fragment_start,
-                cursor..fragment_end,
-                runs,
-                font_size,
-                window,
-            ));
-        }
-        shaped
-    }
-
-    fn fallback(
-        &self,
-        text: &str,
-        fragment_start: usize,
-        columns: Range<usize>,
-        runs: &[TextRun],
-        font_size: Pixels,
-        window: &mut Window,
-    ) -> ShapedLine {
-        let local = columns.start - fragment_start..columns.end - fragment_start;
-        let mut shaped = window.text_system().shape_line(
-            SharedString::new(&text[local.clone()]),
-            font_size,
-            &slice_runs(runs, local),
-            None,
-        );
-        let origin = atom_x(self.atom_positions, columns.start);
-        align_glyphs_to_atoms(
-            &mut shaped,
-            columns.start,
-            origin,
-            atom_x(self.atom_positions, columns.end),
-            self.atom_positions,
-        );
-        self.origins.borrow_mut().insert(columns.start, origin);
+        debug_assert_eq!(cursor, fragment_end);
         shaped
     }
 }
@@ -8949,95 +9010,73 @@ impl LongRowText<'_> {
 fn shape_text_fragment(
     text: &str,
     offset: usize,
-    runs: &[TextRun],
-    long_row: Option<&LongRowText<'_>>,
+    decorations: &Decorations<'_>,
+    long_row: Option<&LongRowText>,
     font_size: Pixels,
     window: &mut Window,
 ) -> SmallVec<[ShapedLine; 1]> {
-    match long_row {
-        Some(long_row) => long_row.shape(text, offset, runs, font_size, window),
-        None => smallvec![window.text_system().shape_line(
-            SharedString::new(text),
-            font_size,
-            runs,
+    if let Some(long_row) = long_row {
+        return long_row.shape(text, offset, decorations, window);
+    }
+    let len = text.len();
+    let layout =
+        window
+            .text_system()
+            .layout_line(text, font_size, &decorations.styles_in(0..len), None);
+    let runs = decorations.runs(0..len, offset, &layout);
+    smallvec![ShapedLine::new(layout, SharedString::new(text), &runs)]
+}
+
+fn layout_chunk_renderer(
+    renderer: &ChunkRenderer,
+    text: &str,
+    text_style: &TextStyle,
+    text_width: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> (AnyElement, Size<Pixels>) {
+    let available_width = if renderer.constrain_width {
+        let run = text_style.to_run(text.len());
+        let text = if text == "⋯" {
+            SharedString::new_static("⋯")
+        } else {
+            SharedString::new(text)
+        };
+        let shaped_line = window.text_system().shape_line(
+            text,
+            text_style.font_size.to_pixels(window.rem_size()),
+            &[run],
             None,
-        )],
+        );
+        AvailableSpace::Definite(shaped_line.width)
+    } else {
+        AvailableSpace::MinContent
+    };
+    let mut element = (renderer.render)(&mut ChunkRendererContext {
+        context: cx,
+        window,
+        max_width: text_width,
+    });
+    let line_height = text_style.line_height_in_pixels(window.rem_size());
+    let size = element.layout_as_root(
+        size(available_width, AvailableSpace::Definite(line_height)),
+        window,
+        cx,
+    );
+    (element, size)
+}
+
+fn apply_row_metrics(shaped_line: &mut ShapedLine, metrics: RowMetrics) {
+    if shaped_line.ascent == metrics.ascent && shaped_line.descent == metrics.descent {
+        return;
     }
-}
-
-fn slice_runs(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
-    let mut sliced = Vec::new();
-    let mut run_start = 0;
-    for run in runs {
-        let run_end = run_start + run.len;
-        let start = run_start.max(range.start);
-        let end = run_end.min(range.end);
-        if start < end {
-            sliced.push(TextRun {
-                len: end - start,
-                ..run.clone()
-            });
-        }
-        run_start = run_end;
-        if run_start >= range.end {
-            break;
-        }
-    }
-    sliced
-}
-
-fn atom_x(atom_positions: &[(u32, ScrollPixelOffset)], column: usize) -> ScrollPixelOffset {
-    let index = atom_positions.partition_point(|(atom_start, _)| (*atom_start as usize) < column);
-    atom_positions
-        .get(index)
-        .or(atom_positions.last())
-        .map_or(0., |(_, x)| *x)
-}
-
-fn align_glyphs_to_atoms(
-    shaped_line: &mut ShapedLine,
-    start: usize,
-    origin: ScrollPixelOffset,
-    end_x: ScrollPixelOffset,
-    atom_positions: &[(u32, ScrollPixelOffset)],
-) {
-    let last_column = start + shaped_line.len().saturating_sub(1);
-    let mut atom_offsets = HashMap::<u32, Pixels>::default();
-    let runs = shaped_line
-        .runs
-        .iter()
-        .map(|run| ShapedRun {
-            font_id: run.font_id,
-            glyphs: run
-                .glyphs
-                .iter()
-                .map(|glyph| {
-                    let column = (start + glyph.index).min(last_column);
-                    let atom_count = atom_positions
-                        .partition_point(|(atom_start, _)| *atom_start as usize <= column);
-                    let (atom_start, atom_x) = atom_positions[..atom_count]
-                        .last()
-                        .filter(|(atom_start, _)| *atom_start as usize >= start)
-                        .copied()
-                        .unwrap_or((start as u32, origin));
-                    let offset = *atom_offsets
-                        .entry(atom_start)
-                        .or_insert_with(|| Pixels::from(atom_x - origin) - glyph.position.x);
-                    ShapedGlyph {
-                        position: point(glyph.position.x + offset, glyph.position.y),
-                        ..glyph.clone()
-                    }
-                })
-                .collect(),
-        })
-        .collect();
     let layout: &mut Arc<LineLayout> = shaped_line;
     *layout = Arc::new(LineLayout {
         font_size: layout.font_size,
-        width: Pixels::from(end_x - origin),
-        ascent: layout.ascent,
-        descent: layout.descent,
-        runs,
+        width: layout.width,
+        ascent: metrics.ascent,
+        descent: metrics.descent,
+        runs: layout.runs.clone(),
         len: layout.len,
     });
 }
@@ -9291,6 +9330,7 @@ impl Element for EditorElement {
                     let (mut snapshot, is_read_only) = self.editor.update(cx, |editor, cx| {
                         (editor.snapshot(window, cx), editor.read_only(cx))
                     });
+
                     let style = &self.style;
 
                     let rem_size = window.rem_size();
@@ -9304,7 +9344,7 @@ impl Element for EditorElement {
                     let em_width = window.text_system().em_width(font_id, font_size).unwrap();
                     let em_advance = window.text_system().em_advance(font_id, font_size).unwrap();
                     let em_layout_width = window.text_system().em_layout_width(font_id, font_size);
-                    let glyph_grid_cell = size(em_advance, line_height);
+                    let glyph_grid_cell = size(em_layout_width, line_height);
 
                     let gutter_dimensions =
                         snapshot.gutter_dimensions(font_id, font_size, style, window, cx);
@@ -9347,7 +9387,9 @@ impl Element for EditorElement {
                             window,
                             cx,
                         );
-                        editor.set_visible_column_count(f64::from(editor_width / em_advance));
+                        if editor.set_visible_column_count(f64::from(editor_width / em_advance)) {
+                            editor.update_data_on_scroll(true, window, cx);
+                        }
 
                         if matches!(
                             editor.mode,
@@ -9369,6 +9411,9 @@ impl Element for EditorElement {
                             }
                         }
                     });
+                    if !is_minimap && request_layout.prepaint_depth.get() == 1 {
+                        self.measure_unmeasured_renderers(&mut snapshot, editor_width, window, cx);
+                    }
 
                     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
                     let gutter_hitbox = window.insert_hitbox(
@@ -9419,42 +9464,21 @@ impl Element for EditorElement {
                         autoscroll_containing_element,
                         needs_horizontal_autoscroll,
                     ) = self.editor.update(cx, |editor, cx| {
-                        let provisional_autoscroll =
-                            editor.scroll_manager.take_provisional_autoscroll(
-                                &editor.selections.disjoint_anchors_arc(),
-                                editor.selections.pending_anchor(),
+                        let autoscroll_request = editor.scroll_manager.take_autoscroll_request();
+
+                        if !is_minimap
+                            && autoscroll_request.is_none()
+                            && editor.scroll_manager.resolve_horizontal_anchor(
+                                &snapshot,
+                                em_layout_width,
                                 cx,
-                            );
-                        let requested_autoscroll = editor.scroll_manager.take_autoscroll_request();
-                        let autoscroll_request = requested_autoscroll.or(provisional_autoscroll);
-                        if !is_minimap
-                            && autoscroll_request.is_none()
-                            && let Some(request) = editor
-                                .scroll_manager
-                                .horizontal_anchor_measure_request(&snapshot, cx)
-                            && editor.display_map.update(cx, |display_map, cx| {
-                                display_map.measure_long_row_columns(&[request], cx)
-                            })
+                            )
                         {
-                            snapshot = editor.snapshot(window, cx);
-                        }
-                        if !is_minimap
-                            && autoscroll_request.is_none()
-                            && let Some(is_native) = editor
-                                .scroll_manager
-                                .resolve_horizontal_anchor(&snapshot, em_layout_width, cx)
-                        {
-                            if is_native {
-                                cx.emit(EditorEvent::ScrollPositionChanged {
-                                    local: true,
-                                    autoscroll: false,
-                                });
-                            }
                             snapshot = editor.snapshot(window, cx);
                         }
 
                         let autoscroll_containing_element =
-                            requested_autoscroll.is_some() || editor.has_pending_selection();
+                            autoscroll_request.is_some() || editor.has_pending_selection();
 
                         let (needs_horizontal_autoscroll, was_scrolled) = editor
                             .autoscroll_vertically(
@@ -9523,78 +9547,17 @@ impl Element for EditorElement {
                     };
                     let long_row_scroll_x =
                         window.pixel_snap_f64(scroll_position.x * f64::from(em_layout_width));
-                    let row_windows = |snapshot: &EditorSnapshot| {
-                        snapshot.long_rows_in_view(start_row..end_row, |long_row| {
-                            if is_minimap {
-                                RowWindow::prefix(long_row.floor_column(MAX_LINE_LEN as u32))
-                            } else {
-                                long_row.chunk_aligned(&long_row.window(
-                                    long_row_scroll_x,
-                                    style.text.text_align,
-                                    f64::from(editor_width),
-                                ))
-                            }
-                        })
-                    };
-                    let mut long_rows = row_windows(&snapshot);
-                    let mut measured_long_rows = false;
-                    for _ in 0..MAX_ROW_WINDOW_MEASURE_PASSES {
+                    let long_rows = snapshot.long_rows_in_view(start_row..end_row, |long_row| {
                         if is_minimap {
-                            break;
+                            RowWindow::prefix(long_row.floor_column(MAX_LINE_LEN as u32))
+                        } else {
+                            long_row.visible_window(
+                                long_row_scroll_x - f64::from(gutter_dimensions.margin),
+                                style.text.text_align,
+                                f64::from(text_hitbox.size.width),
+                            )
                         }
-                        let requests = long_rows
-                            .iter()
-                            .filter_map(|(row, long_row, row_window)| {
-                                let runs = long_row_shaping_runs(
-                                    &snapshot, *row, row_window, style, window, cx,
-                                );
-                                long_row.measure_request(row_window, &runs)
-                            })
-                            .collect::<Vec<_>>();
-                        if requests.is_empty() {
-                            break;
-                        }
-                        let measured = self.editor.update(cx, |editor, cx| {
-                            editor.display_map.update(cx, |display_map, cx| {
-                                display_map.measure_long_row_columns(&requests, cx)
-                            })
-                        });
-                        if !measured {
-                            break;
-                        }
-                        measured_long_rows = true;
-                        snapshot = self
-                            .editor
-                            .update(cx, |editor, cx| editor.snapshot(window, cx));
-                        long_rows = row_windows(&snapshot);
-                    }
-                    if measured_long_rows
-                        && autoscroll_request.is_none()
-                        && request_layout.has_remaining_prepaint_depth()
-                        && self.editor.update(cx, |editor, cx| {
-                            let is_native = editor.scroll_manager.resolve_horizontal_anchor(
-                                &snapshot,
-                                em_layout_width,
-                                cx,
-                            );
-                            if is_native == Some(true) {
-                                cx.emit(EditorEvent::ScrollPositionChanged {
-                                    local: true,
-                                    autoscroll: false,
-                                });
-                            }
-                            is_native.is_some()
-                        })
-                    {
-                        return self.prepaint(
-                            None,
-                            _inspector_id,
-                            bounds,
-                            request_layout,
-                            window,
-                            cx,
-                        );
-                    }
+                    });
                     let visible_ranges =
                         visible_anchor_ranges(&snapshot, start_anchor..end_anchor, &long_rows);
 
@@ -10012,15 +9975,28 @@ impl Element for EditorElement {
                         &mut highlighted_ranges,
                         cx,
                     );
-                    clip_ranges_to_row_windows(
-                        &mut highlighted_ranges,
-                        |(range, _)| range,
-                        &long_rows,
-                    );
-                    if let Some((_, colors)) = document_colors.as_mut() {
-                        clip_ranges_to_row_windows(colors, |(range, _)| range, &long_rows);
+                    if !long_rows.is_empty() {
+                        let painted_columns = |row| {
+                            let index = long_rows
+                                .binary_search_by_key(&row, |(long_row_row, ..)| *long_row_row)
+                                .ok()?;
+                            let segments = long_rows[index].2.segments();
+                            Some(segments.first()?.start..segments.last()?.end)
+                        };
+                        clip_ranges_to_columns(
+                            &mut highlighted_ranges,
+                            |(range, _)| range,
+                            painted_columns,
+                        );
+                        if let Some((_, colors)) = document_colors.as_mut() {
+                            clip_ranges_to_columns(colors, |(range, _)| range, painted_columns);
+                        }
+                        clip_ranges_to_columns(
+                            &mut redacted_ranges,
+                            |range| range,
+                            painted_columns,
+                        );
                     }
-                    clip_ranges_to_row_windows(&mut redacted_ranges, |range| range, &long_rows);
 
                     let bg_segments_per_row = Self::bg_segments_per_row(
                         start_row..end_row,
@@ -10038,40 +10014,19 @@ impl Element for EditorElement {
                         &snapshot,
                         &self.style,
                         editor_width,
+                        text_hitbox.size.width,
+                        long_row_scroll_x,
                         &long_rows,
                         is_row_soft_wrapped,
                         &bg_segments_per_row,
                         window,
                         cx,
                     );
-                    let new_renderer_widths = (!is_minimap).then(|| {
-                        line_layouts
-                            .iter()
-                            .flat_map(|layout| &layout.fragments)
-                            .filter_map(|fragment| {
-                                if let LineFragment::Element { id, size, .. } = fragment {
-                                    Some((*id, size.width))
-                                } else {
-                                    None
-                                }
-                            })
-                    });
-                    let renderer_widths_key = RendererWidthsKey {
-                        rem_size: window.rem_size(),
-                        font: window.text_style().font(),
-                        font_size: window.text_style().font_size.to_pixels(window.rem_size()),
-                    };
-                    let renderer_widths_changed = request_layout.has_remaining_prepaint_depth()
-                        && new_renderer_widths.is_some_and(|new_renderer_widths| {
-                            self.editor.update(cx, |editor, cx| {
-                                editor.update_renderer_widths(
-                                    renderer_widths_key,
-                                    new_renderer_widths,
-                                    cx,
-                                )
-                            })
-                        });
+                    let renderer_widths_changed = !is_minimap
+                        && request_layout.has_remaining_prepaint_depth()
+                        && self.publish_renderer_widths(&line_layouts, editor_width, window, cx);
                     if renderer_widths_changed {
+                        self.retain_autoscroll_request(autoscroll_request, cx);
                         return self.prepaint(
                             None,
                             _inspector_id,
@@ -10118,37 +10073,32 @@ impl Element for EditorElement {
                         .unwrap_or(Pixels::ZERO);
 
                     let longest_row = snapshot.longest_row();
+                    let longest_line_width =
+                        match snapshot.long_row(longest_row).filter(|_| !is_minimap) {
+                            Some(long_row) => long_row.width(),
+                            None => {
+                                layout_line(
+                                    longest_row,
+                                    &snapshot,
+                                    style,
+                                    editor_width,
+                                    0.,
+                                    is_row_soft_wrapped,
+                                    window,
+                                    cx,
+                                )
+                                .width
+                            }
+                        };
                     let longest_line_width = if is_minimap {
-                        layout_line(
-                            longest_row,
-                            &snapshot,
-                            style,
-                            editor_width,
-                            0.,
-                            is_row_soft_wrapped,
-                            window,
-                            cx,
-                        )
-                        .width
-                    } else if let Some(long_row) = snapshot.long_row(longest_row) {
-                        long_row.width().max(snapshot.max_long_row_width())
+                        longest_line_width
                     } else {
-                        layout_line(
-                            longest_row,
-                            &snapshot,
-                            style,
-                            editor_width,
-                            0.,
-                            is_row_soft_wrapped,
-                            window,
-                            cx,
-                        )
-                        .width
-                        .max(snapshot.max_long_row_width())
+                        longest_line_width.max(snapshot.max_long_row_width())
                     };
                     let longest_line_width = line_layouts
                         .iter()
-                        .filter_map(LineWithInvisibles::long_row_extent)
+                        .filter(|line| line.long_row.is_some())
+                        .map(|line| line.width)
                         .fold(longest_line_width, ScrollPixelOffset::max);
 
                     let scrollbar_layout_information = ScrollbarLayoutInformation::new(
@@ -10210,7 +10160,6 @@ impl Element for EditorElement {
                                     gutter_dimensions.full_width(),
                                     line_height,
                                     &line_layouts,
-                                    &local_selections,
                                     &selected_buffer_ids,
                                     &latest_selection_anchors,
                                     is_row_soft_wrapped,
@@ -10320,20 +10269,47 @@ impl Element for EditorElement {
                             let long_row = line.uncovered_long_row(
                                 scroll_pixel_position.x,
                                 style.text.text_align,
-                                editor_width,
+                                gutter_dimensions.margin,
+                                text_hitbox.size.width,
                             )?;
                             Some((index, long_row))
                         })
                         .collect::<Vec<_>>();
-                    if uncovered_long_rows
-                        .iter()
-                        .any(|(_, (_, _, covered))| !covered)
-                        && request_layout.has_remaining_prepaint_depth()
+                    let restart_for_uncovered_long_rows = !uncovered_long_rows.is_empty()
+                        && request_layout.has_remaining_prepaint_depth();
+                    let sticky_header_lines = if !restart_for_uncovered_long_rows
+                        && !is_minimap
+                        && is_singleton
+                        && EditorSettings::get_global(cx).sticky_scroll.enabled
                     {
-                        if let Some((autoscroll, _)) = autoscroll_request {
-                            self.editor
-                                .update(cx, |editor, cx| editor.request_autoscroll(autoscroll, cx));
-                        }
+                        self.layout_sticky_header_lines(
+                            &snapshot,
+                            editor_width,
+                            text_hitbox.size.width,
+                            gutter_dimensions.margin,
+                            is_row_soft_wrapped,
+                            scroll_pixel_position.x,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let sticky_renderer_widths_changed = request_layout
+                        .has_remaining_prepaint_depth()
+                        && sticky_header_lines.iter().any(|(_, line)| {
+                            line.fragments
+                                .iter()
+                                .any(|fragment| matches!(fragment, LineFragment::Element { .. }))
+                        })
+                        && self.publish_renderer_widths(
+                            sticky_header_lines.iter().map(|(_, line)| line),
+                            editor_width,
+                            window,
+                            cx,
+                        );
+                    if restart_for_uncovered_long_rows || sticky_renderer_widths_changed {
+                        self.retain_autoscroll_request(autoscroll_request, cx);
                         return self.prepaint(
                             None,
                             _inspector_id,
@@ -10343,7 +10319,7 @@ impl Element for EditorElement {
                             cx,
                         );
                     }
-                    for (index, (long_row, row_window, _)) in uncovered_long_rows {
+                    for (index, (long_row, row_window)) in uncovered_long_rows {
                         line_layouts[index] = LineWithInvisibles::long_row(
                             long_row,
                             start_row + DisplayRow(index as u32),
@@ -10351,32 +10327,14 @@ impl Element for EditorElement {
                             style,
                             row_window,
                             editor_width,
+                            text_hitbox.size.width,
+                            scroll_pixel_position.x,
                             bg_segments_per_row.get(index).map_or(&[], Vec::as_slice),
                             window,
                             cx,
                         );
                     }
-                    if !is_minimap
-                        && let Some(autoscroll_request) = autoscroll_request
-                        && local_selections.iter().any(|selection| {
-                            let head = selection.head().to_display_point(&snapshot).row();
-                            head.0
-                                .checked_sub(start_row.0)
-                                .and_then(|index| line_layouts.get(index as usize))
-                                .is_some_and(LineWithInvisibles::is_provisional)
-                        })
-                    {
-                        self.editor.update(cx, |editor, cx| {
-                            let disjoint = editor.selections.disjoint_anchors_arc();
-                            let pending = editor.selections.pending_anchor().cloned();
-                            editor.scroll_manager.retain_provisional_autoscroll(
-                                autoscroll_request,
-                                disjoint,
-                                pending,
-                                cx,
-                            );
-                        });
-                    }
+
                     if !is_minimap {
                         let horizontal_anchor = (style.text.text_align == TextAlign::Left)
                             .then(|| {
@@ -10390,25 +10348,19 @@ impl Element for EditorElement {
                             })
                             .flatten();
                         self.editor.update(cx, |editor, cx| {
-                            let workspace_id =
-                                editor.workspace.as_ref().and_then(|workspace| workspace.1);
                             editor.scroll_manager.store_horizontal_anchor(
                                 horizontal_anchor,
                                 &snapshot,
-                                workspace_id,
                                 cx,
-                            )
+                            );
+                            editor.persist_scroll_position(&snapshot, cx);
                         });
                     }
-                    let sticky_headers = if !is_minimap
-                        && is_singleton
-                        && EditorSettings::get_global(cx).sticky_scroll.enabled
-                    {
+                    let sticky_headers = if !sticky_header_lines.is_empty() {
                         let relative = self.editor.read(cx).relative_line_numbers(cx);
                         self.layout_sticky_headers(
+                            sticky_header_lines,
                             &snapshot,
-                            editor_width,
-                            is_row_soft_wrapped,
                             line_height,
                             scroll_pixel_position,
                             content_origin,
@@ -10879,8 +10831,7 @@ impl Element for EditorElement {
                     });
 
                     let wrap_guides = self.layout_wrap_guides(
-                        em_advance,
-                        scroll_position,
+                        scroll_pixel_position.x,
                         content_origin,
                         scrollbars_layout.as_ref(),
                         vertical_scrollbar_width,
@@ -11892,15 +11843,12 @@ impl PositionMap {
         let (column, x_overshoot_after_line_end) = if let Some(line) = line {
             let x_relative_to_text = x - line.alignment_offset(self.text_align, self.content_width);
             if let Some(ix) = line.index_for_x(x_relative_to_text) {
-                (ix as u32, px(0.))
+                (ix as u32, 0.)
             } else {
-                (
-                    line.len as u32,
-                    px(0.).max(Pixels::from(x_relative_to_text - line.width)),
-                )
+                (line.len as u32, (x_relative_to_text - line.width).max(0.))
             }
         } else {
-            (0, Pixels::from(x))
+            (0, x)
         };
 
         let mut exact_unclipped = DisplayPoint::new(row, column);
@@ -11918,7 +11866,7 @@ impl PositionMap {
         };
 
         let column_overshoot_after_line_end =
-            (x_overshoot_after_line_end / self.em_layout_width) as u32;
+            (x_overshoot_after_line_end / ScrollPixelOffset::from(self.em_layout_width)) as u32;
         *exact_unclipped.column_mut() += column_overshoot_after_line_end;
         PointForPosition {
             previous_valid,
@@ -11932,14 +11880,51 @@ impl PositionMap {
 
 const BLOCK_COORDINATE_MARGIN: ScrollPixelOffset = 1_048_576.;
 
-const MAX_ROW_WINDOW_MEASURE_PASSES: usize = 4;
+const RENDERER_MEASURE_BUDGET_PER_PREPAINT: usize = 1024;
 
-fn rebased_block_width(width: AvailableSpace, base: ScrollPixelOffset) -> AvailableSpace {
-    match width {
-        AvailableSpace::Definite(width) if base > 0. => {
-            AvailableSpace::Definite(Pixels::from(ScrollPixelOffset::from(width) - base))
+const RENDERER_VISIT_COST: usize = 1;
+
+const RENDERER_LAYOUT_COST: usize = 31;
+
+struct PrepaintWorkBudget {
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl PrepaintWorkBudget {
+    fn new(units: usize) -> Self {
+        Self {
+            remaining: units,
+            exhausted: false,
         }
-        width => width,
+    }
+
+    fn try_charge(&mut self, cost: usize) -> bool {
+        match self.remaining.checked_sub(cost) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                true
+            }
+            None => {
+                self.exhausted = true;
+                false
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BlockWidth {
+    MinContent,
+    Definite(ScrollPixelOffset),
+}
+
+impl BlockWidth {
+    fn rebased(self, base: ScrollPixelOffset) -> AvailableSpace {
+        match self {
+            Self::MinContent => AvailableSpace::MinContent,
+            Self::Definite(width) => AvailableSpace::Definite(Pixels::from(width - base)),
+        }
     }
 }
 
@@ -11977,13 +11962,9 @@ pub fn layout_line(
                 cx,
             );
         }
-        let row_window = long_row.chunk_aligned(&long_row.window(
-            scroll_x,
-            style.text.text_align,
-            f64::from(text_width),
-        ));
-        let runs = long_row_shaping_runs(snapshot, row, &row_window, style, window, cx);
-        let long_row = long_row.restyled(&runs).unwrap_or(long_row);
+
+        let row_window =
+            long_row.visible_window(scroll_x, style.text.text_align, f64::from(text_width));
         return LineWithInvisibles::long_row(
             long_row,
             row,
@@ -11991,17 +11972,14 @@ pub fn layout_line(
             style,
             row_window,
             text_width,
+            text_width,
+            scroll_x,
             &[],
             window,
             cx,
         );
     }
-    let use_tree_sitter =
-        !snapshot.semantic_tokens_enabled || snapshot.use_tree_sitter_for_syntax(row, cx);
-    let language_aware = LanguageAwareStyling {
-        tree_sitter: use_tree_sitter,
-        diagnostics: true,
-    };
+    let language_aware = language_aware_styling(snapshot, row);
     let chunks = snapshot.highlighted_chunks(row..row + DisplayRow(1), language_aware, style);
     LineWithInvisibles::from_chunks(
         chunks,
@@ -12487,19 +12465,20 @@ fn compute_auto_height_layout(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
-        Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer, NavigationOverlayKey,
-        NavigationOverlayLabel, NavigationTargetOverlay, SelectionEffects, ToggleSoftWrap,
+        Editor, EditorEvent, FoldPlaceholder, HighlightKey, Inlay, MoveDown, MoveUp, MultiBuffer,
+        NavigationOverlayKey, NavigationOverlayLabel, NavigationTargetOverlay, ScrollAnchor,
+        SelectionEffects, ToggleSoftWrap,
         display_map::{BlockPlacement, BlockProperties, DisplayMap},
-        editor_tests::{init_test, update_test_language_settings},
-        movement::TextLayoutDetails,
+        editor_tests::{init_test, update_test_editor_settings, update_test_language_settings},
+        test::ShapingTextSystem,
     };
     use buffer_diff::BufferDiff;
     use gpui::{
-        FontStyle, GlyphId, HighlightStyle, Render, ShapedGlyph, ShapedRun, TestAppContext,
-        Underline, UpdateGlobal, VisualTestContext, WindowHandle, font,
+        FontStyle, HighlightStyle, Render, StrikethroughStyle, TestAppContext, Underline,
+        UpdateGlobal, VisualTestContext, WindowHandle, font,
     };
     use language::{
         Buffer, Capability, Diagnostic, DiagnosticEntry, DiagnosticSet, SelectionGoal,
@@ -12510,7 +12489,7 @@ mod tests {
     use multi_buffer::PathKey;
     use parking_lot::Mutex;
     use rand::{RngCore, rngs::StdRng};
-    use std::num::NonZeroU32;
+    use std::{cell::RefCell, num::NonZeroU32};
     use text::PointUtf16;
     use util::test::sample_text;
 
@@ -13657,15 +13636,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_point_for_position_keeps_precision_far_past_line_ends(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let (editor, ref mut cx) = editor_test_context(&format!("\n{}", "x".repeat(30_000)), cx);
+        let mut style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        style.text.font_size = px(1_000.).into();
+        draw_editor(&editor, &style, cx);
+        cx.run_until_parked();
+        let em_layout_width = ScrollPixelOffset::from(
+            draw_editor(&editor, &style, cx)
+                .position_map
+                .em_layout_width,
+        );
+
+        let target_column = 28_000_u32;
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(point(f64::from(target_column - 1), 0.), window, cx);
+        });
+        let state = draw_editor(&editor, &style, cx);
+        let position_map = &state.position_map;
+        let column_start_x = f64::from(target_column) * em_layout_width;
+        let target_x = column_start_x - 0.25;
+        assert!(
+            f64::from(target_x as f32) >= column_start_x,
+            "{target_x} survives a round trip through f32"
+        );
+        let offset = target_x - position_map.scroll_pixel_position.x;
+        let point = position_map.point_for_position(point(
+            position_map.text_hitbox.bounds.origin.x + Pixels::from(offset),
+            px(0.),
+        ));
+        assert_eq!(
+            point.exact_unclipped,
+            DisplayPoint::new(DisplayRow(0), target_column - 1)
+        );
+    }
+
+    #[gpui::test]
     fn test_long_rows_paint_and_hit_test_at_row_geometry(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
         let long_row = "ab\u{0}漢\té ".repeat(1_000);
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&format!("short\n{long_row}\nshort"), cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, cx);
-        let editor = window.root(cx).unwrap();
+        let (editor, ref mut cx) = editor_test_context(&format!("short\n{long_row}\nshort"), cx);
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
         editor.update_in(cx, |editor, window, cx| {
             editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
@@ -13675,9 +13686,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style)
-        });
+        let state = draw_editor(&editor, &style, cx);
         let (snapshot, details) = editor.update_in(cx, |editor, window, cx| {
             (
                 editor.snapshot(window, cx),
@@ -13692,8 +13701,8 @@ mod tests {
         let window_columns = line
             .long_row
             .as_ref()
-            .and_then(|window| window.segments.first())
-            .map(|segment| segment.columns.clone())
+            .and_then(|window| window.plan.segments().first())
+            .map(|segment| segment.start as usize..segment.end as usize)
             .expect("the long row is laid out as a window");
         assert!(window_columns.start > 0);
         assert!(window_columns.end < line.len);
@@ -13736,46 +13745,17 @@ mod tests {
                 DisplayPoint::new(row, column as u32)
             );
         }
+        for (column, _) in line_text.match_indices('漢') {
+            let after_han = row_x(column + 3);
+            assert!(after_han > row_x(column));
+            let interior_xs = [1, 2, 3].map(|offset| line.x_for_index(column + offset));
+            assert_eq!(interior_xs, [interior_xs[2]; 3]);
+            assert!((interior_xs[2] - after_han).abs() < 0.01);
+        }
     }
 
     #[gpui::test]
-    fn test_long_row_active_spec_counts_horizontally_hidden_selections(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&format!("{}\nshort", "x".repeat(10_000)), cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, cx);
-        let editor = window.root(cx).unwrap();
-        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
-        editor.update_in(cx, |editor, window, cx| {
-            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                selections.select_ranges([
-                    Point::new(0, 0)..Point::new(0, 5),
-                    Point::new(1, 0)..Point::new(1, 0),
-                ])
-            });
-            editor.set_scroll_position(point(5_000., 0.), window, cx);
-        });
-        cx.run_until_parked();
-
-        let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style)
-        });
-        let line = &state.position_map.line_layouts[0];
-        let window = line.long_row.as_ref().expect("a windowed long row");
-        assert!(!window.contains_column(0));
-        assert_eq!(
-            state
-                .active_rows
-                .get(&DisplayRow(0))
-                .map(|spec| spec.selection),
-            Some(true)
-        );
-    }
-
-    #[gpui::test]
-    fn test_long_row_point_diagnostics_skip_horizontally_hidden_columns(cx: &mut TestAppContext) {
+    fn test_long_row_decorations_skip_horizontally_hidden_columns(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
         let empty_range = |column| PointUtf16::new(0, column)..PointUtf16::new(0, column);
         let buffer = point_diagnostic_buffer(
@@ -13793,15 +13773,27 @@ mod tests {
         let editor = window.root(cx).unwrap();
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
         editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([
+                    Point::new(0, 0)..Point::new(0, 5),
+                    Point::new(1, 0)..Point::new(1, 0),
+                ])
+            });
             editor.set_scroll_position(point(5_000., 0.), window, cx);
         });
         cx.run_until_parked();
 
-        let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style)
-        });
+        let state = draw_editor(&editor, &style, cx);
         let line = &state.position_map.line_layouts[0];
-        assert!(line.long_row.is_some());
+        let window = line.long_row.as_ref().expect("a windowed long row");
+        assert!(!window.contains_column(0));
+        assert_eq!(
+            state
+                .active_rows
+                .get(&DisplayRow(0))
+                .map(|spec| spec.selection),
+            Some(true)
+        );
         assert_eq!(
             line.point_diagnostics
                 .iter()
@@ -13812,29 +13804,15 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_long_row_interior_byte_x_is_next_grapheme(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
-        let (state, snapshot, details) =
-            draw_single_row_editor(&format!("漢{}", "x".repeat(1_100)), 0., cx);
-        let line = &state.position_map.line_layouts[0];
-        assert!(line.long_row.is_some());
-        let after_han = snapshot.x_for_display_point(DisplayPoint::new(DisplayRow(0), 3), &details);
-        assert!(after_han > 0.);
-        let interior_xs = [1, 2, 3].map(|column| line.x_for_index(column));
-        assert_eq!(interior_xs, [interior_xs[2]; 3]);
-        assert!((interior_xs[2] - after_han).abs() < 0.01);
-    }
-
-    #[gpui::test]
     fn test_long_row_window_keeps_clipped_tab_bounds(cx: &mut TestAppContext) {
         init_test(cx, |settings| {
             settings.defaults.tab_size = NonZeroU32::new(128);
         });
-        let (state, _, _) = draw_single_row_editor(&"\t".repeat(9), 120., cx);
+        let state = draw_single_row_editor(&"\t".repeat(9), 120., cx);
         let line = &state.position_map.line_layouts[0];
         let window = line.long_row.as_ref().expect("a windowed long row");
-        assert_eq!(window.segments.len(), 1, "{window:?}");
-        let columns = window.segments[0].columns.clone();
+        assert_eq!(window.plan.segments().len(), 1, "{window:?}");
+        let columns = window.plan.segments()[0].clone();
         assert!(
             (1..128).contains(&columns.start) && (129..=256).contains(&columns.end),
             "{window:?}"
@@ -13855,9 +13833,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_autoscroll_is_reapplied_after_long_row_measurement(cx: &mut TestAppContext) {
+    fn test_autoscroll_after_long_row_insertion(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
-        let window = cx.add_window(|window, cx| {
+        let window = cx.open_window(size(px(500.), px(500.)), |window, cx| {
             let buffer = MultiBuffer::build_simple(&"x".repeat(2_000), cx);
             Editor::new(EditorMode::full(), buffer, None, window, cx)
         });
@@ -13865,27 +13843,15 @@ mod tests {
         let editor = window.root(cx).unwrap();
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
         cx.run_until_parked();
-        let draw = |cx: &mut VisualTestContext| {
-            cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-                EditorElement::new(&editor, style.clone())
-            })
-            .1
-        };
-        draw(cx);
+        draw_editor(&editor, &style, cx);
 
         let inserted = "漢".repeat(40_000);
-        cx.background_executor.set_block_on_ticks(0..=0);
         editor.update_in(cx, |editor, window, cx| {
             editor.insert(&inserted, window, cx)
         });
-        let estimated = draw(cx);
-        assert!(estimated.position_map.line_layouts[0].is_provisional());
-
-        cx.run_until_parked();
-        let measured = draw(cx);
-        let line = &measured.position_map.line_layouts[0];
-        assert!(!line.is_provisional());
-        let position_map = &measured.position_map;
+        let state = draw_editor(&editor, &style, cx);
+        let line = &state.position_map.line_layouts[0];
+        let position_map = &state.position_map;
         let cursor_x = position_map.content_origin.x
             + Pixels::from(line.x_for_index(inserted.len()) - position_map.scroll_pixel_position.x);
         let bounds = position_map.text_hitbox.bounds;
@@ -13896,111 +13862,176 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_pending_long_rows_paint_measured_windows(cx: &mut TestAppContext) {
+    fn test_autoscroll_survives_renderer_width_restart(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
-        cx.background_executor.set_block_on_ticks(0..=0);
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&"é".repeat(40_000), cx);
+        let window = cx.open_window(size(px(500.), px(500.)), |window, cx| {
+            let buffer = MultiBuffer::build_simple(
+                &format!("{}{}", "x\n".repeat(332), "x".repeat(2_000)),
+                cx,
+            );
             Editor::new(EditorMode::full(), buffer, None, window, cx)
         });
         let cx = &mut VisualTestContext::from_window(*window, cx);
         let editor = window.root(cx).unwrap();
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        cx.run_until_parked();
+        draw_editor(&editor, &style, cx);
         editor.update_in(cx, |editor, window, cx| {
-            editor.set_scroll_position(point(10_000., 0.), window, cx);
+            let buffer = editor.buffer().read(cx).snapshot(cx);
+            let inlays = (300..=332)
+                .map(|row| {
+                    Inlay::mock_repl_result(
+                        row as usize,
+                        buffer.anchor_after(Point::new(row, 1)),
+                        "result",
+                    )
+                })
+                .collect();
+            editor.splice_inlays(&[], inlays, cx);
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::newest()),
+                window,
+                cx,
+                |selections| {
+                    selections.select_ranges([Point::new(332, 1_800)..Point::new(332, 1_800)])
+                },
+            );
         });
-        let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style)
+        let state = draw_editor(&editor, &style, cx);
+        let position_map = &state.position_map;
+        assert!(position_map.scroll_pixel_position.x > 0.);
+        let row = DisplayRow(332);
+        let line =
+            &position_map.line_layouts[row.minus(position_map.visible_row_range.start) as usize];
+        let cursor_x = position_map.content_origin.x
+            + Pixels::from(line.x_for_index(1_806) - position_map.scroll_pixel_position.x);
+        assert!(cursor_x >= position_map.text_hitbox.bounds.left());
+        assert!(cursor_x <= position_map.text_hitbox.bounds.right());
+    }
+
+    #[gpui::test]
+    fn test_vertical_moves_into_long_rows(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let characters = 20_000;
+        let source = "x".repeat(characters * 5 / 2);
+        let destination = format!("{}{}", "𝒜".repeat(characters), "x".repeat(characters));
+        let (editor, ref mut cx) = editor_test_context(&format!("{source}\n{destination}"), cx);
+        editor.update_in(cx, |editor, window, cx| {
+            let source_end = Point::new(0, source.len() as u32);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([source_end..source_end])
+            });
+            editor.move_down(&MoveDown, window, cx);
         });
-        let line = &state.position_map.line_layouts[0];
-        assert!(line.is_provisional());
-        let segment = line
-            .long_row
-            .as_ref()
-            .and_then(|window| window.segments.first())
-            .expect("a windowed long row");
-        let character_width = f64::from(state.position_map.em_layout_width);
-        let advances = segment
-            .atom_positions
-            .windows(2)
-            .map(|pair| pair[1].1 - pair[0].1)
-            .collect::<Vec<_>>();
-        assert!(!advances.is_empty());
-        assert!(
-            advances
-                .iter()
-                .all(|advance| (advance - character_width).abs() < 1e-2),
-            "{advances:?}"
+        let column_at_source_end = (characters * "𝒜".len() + characters / 2) as u32;
+        assert_eq!(
+            newest_head(&editor, cx),
+            Point::new(1, column_at_source_end)
         );
     }
 
     #[gpui::test]
-    fn test_horizontal_scroll_keeps_text_in_place_after_long_row_measurement(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx, |_| {});
-        cx.background_executor.set_block_on_ticks(0..=0);
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&"é".repeat(40_000), cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, cx);
-        let editor = window.root(cx).unwrap();
-        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
-        editor.update_in(cx, |editor, window, cx| {
-            editor.set_scroll_position(point(10_000., 0.), window, cx);
-        });
-        let draw = |cx: &mut VisualTestContext| {
-            cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-                EditorElement::new(&editor, style.clone())
-            })
-            .1
-        };
-        let left_column = |state: &EditorLayout| {
-            let line = &state.position_map.line_layouts[0];
-            line.index_for_x(state.position_map.scroll_pixel_position.x)
-        };
-
-        let estimated = draw(cx);
-        assert!(estimated.position_map.line_layouts[0].is_provisional());
-        let estimated_column = left_column(&estimated);
-        assert!(estimated_column.is_some());
-
-        cx.background_executor.set_block_on_ticks(0..=50);
+    fn test_vertical_moves_from_long_rows() {
+        let mut cx = shaping_test_context();
+        init_test(&mut cx, |_| {});
+        let source = format!("{}{}", "x".repeat(70_000), "w".repeat(30_000));
+        let destination = "x".repeat(100_000);
+        let (editor, ref mut cx) = editor_test_context(&format!("\n{destination}"), &mut cx);
         cx.run_until_parked();
-        let measured = draw(cx);
-        assert!(!measured.position_map.line_layouts[0].is_provisional());
-        assert_eq!(left_column(&measured), estimated_column);
+        editor.update(cx, |editor, cx| {
+            editor.buffer().update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(MultiBufferOffset(0)..MultiBufferOffset(0), source.as_str())],
+                    None,
+                    cx,
+                );
+            });
+        });
+        let source_end = Point::new(0, source.len() as u32);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([source_end..source_end])
+            });
+            editor.move_down(&MoveDown, window, cx);
+        });
+        let source_end_in_x_advances = 70_000 + 30_000 * 3 / 4;
+        assert_eq!(
+            newest_head(&editor, cx),
+            Point::new(1, source_end_in_x_advances)
+        );
+
+        editor.update_in(cx, |editor, window, cx| editor.move_up(&MoveUp, window, cx));
+        assert_eq!(newest_head(&editor, cx), source_end);
     }
 
     #[gpui::test]
     fn test_cloned_editor_keeps_horizontal_scroll_on_text(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&"é".repeat(200_000), cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, cx);
-        let editor = window.root(cx).unwrap();
+        let (editor, ref mut cx) = editor_test_context(&"é".repeat(200_000), cx);
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
         cx.run_until_parked();
         editor.update_in(cx, |editor, window, cx| {
             editor.set_scroll_position(point(100_000., 0.), window, cx);
         });
         let original = draw_editor(&editor, &style, cx);
-        assert!(!original.position_map.line_layouts[0].is_provisional());
-
-        cx.background_executor.set_block_on_ticks(0..=0);
         let clone = editor.update_in(cx, |editor, window, cx| {
             cx.new(|cx| editor.clone(window, cx))
         });
         let cloned = draw_editor(&clone, &style, cx);
-        assert!(cloned.position_map.line_layouts[0].is_provisional());
+
         assert_eq!(left_edge_point(&cloned), left_edge_point(&original));
     }
 
     #[gpui::test]
-    async fn test_restored_editor_keeps_horizontal_scroll_on_text(cx: &mut TestAppContext) {
+    fn test_render_scroll_corrections_keep_remote_provenance(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let (editor, ref mut cx) = editor_test_context(&"é".repeat(200_000), cx);
+        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        cx.run_until_parked();
+        let scroll_events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let scroll_events = scroll_events.clone();
+            cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
+                if let EditorEvent::ScrollPositionChanged { local, .. } = event {
+                    scroll_events.borrow_mut().push(*local);
+                }
+            })
+        });
+
+        editor.update_in(cx, |editor, window, cx| {
+            let anchor = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_before(Point::zero());
+            editor.set_scroll_anchor_remote(
+                ScrollAnchor {
+                    anchor,
+                    offset: point(100_000.3, 0.),
+                },
+                window,
+                cx,
+            );
+        });
+        for _ in 0..3 {
+            draw_editor(&editor, &style, cx);
+            cx.run_until_parked();
+        }
+        let remote_events = scroll_events.take();
+        assert!(!remote_events.is_empty());
+        assert_eq!(remote_events, vec![false; remote_events.len()]);
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(point(50_000.3, 0.), window, cx);
+        });
+        draw_editor(&editor, &style, cx);
+        let local_events = scroll_events.take();
+        assert!(!local_events.is_empty());
+        assert_eq!(local_events, vec![true; local_events.len()]);
+    }
+
+    #[gpui::test]
+    async fn test_persisted_horizontal_scroll_follows_edits_and_restores(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
         let workspace_id = cx
             .update(|cx| workspace::WorkspaceDb::global(cx))
@@ -14008,8 +14039,9 @@ mod tests {
             .await
             .unwrap();
         let editor_db = cx.update(|cx| crate::persistence::EditorDb::global(cx));
-        let item_id = 4321;
-        let saved_point = Point::new(0, 200_000);
+        let text = "é".repeat(200_000);
+        let (editor, ref mut cx) = editor_test_context(&text, cx);
+        let item_id = editor.entity_id().as_u64() as workspace::ItemId;
         editor_db
             .save_serialized_editor(
                 item_id,
@@ -14018,39 +14050,51 @@ mod tests {
             )
             .await
             .unwrap();
-        editor_db
-            .save_scroll_position(
-                item_id,
-                workspace_id,
-                0,
-                1.,
-                0.,
-                Some(saved_point.row),
-                Some(saved_point.column),
-                Some(0.),
-            )
-            .await
-            .unwrap();
-
-        cx.background_executor.set_block_on_ticks(0..=0);
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&"é".repeat(200_000), cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, cx);
-        let editor = window.root(cx).unwrap();
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        cx.run_until_parked();
         editor.update_in(cx, |editor, window, cx| {
+            editor.workspace = Some((WeakEntity::new_invalid(), Some(workspace_id)));
+            editor.set_scroll_position(point(100_000., 0.), window, cx);
+        });
+        let scrolled = draw_editor(&editor, &style, cx);
+
+        editor.update(cx, |editor, cx| {
+            editor.buffer().update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(MultiBufferOffset(0)..MultiBufferOffset(0), "y".repeat(100))],
+                    None,
+                    cx,
+                )
+            })
+        });
+        let edited = draw_editor(&editor, &style, cx);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let live_point = left_edge_point(&edited).expect("a visible left edge");
+        assert_eq!(
+            left_edge_point(&scrolled).map(|point| point.column + 100),
+            Some(live_point.column)
+        );
+        let (_, _, _, row, column, _) = editor_db
+            .get_scroll_position(item_id, workspace_id)
+            .unwrap()
+            .expect("a persisted scroll position");
+        assert_eq!(row.zip(column), Some((live_point.row, live_point.column)));
+
+        let edited_text = format!("{}{text}", "y".repeat(100));
+        let (restored_editor, ref mut cx) = editor_test_context(&edited_text, cx);
+        restored_editor.update_in(cx, |editor, window, cx| {
             editor.read_scroll_position_from_db(item_id, workspace_id, window, cx);
         });
-        let restored = draw_editor(&editor, &style, cx);
-        assert!(restored.position_map.line_layouts[0].is_provisional());
+        let restored = draw_editor(&restored_editor, &style, cx);
+
         let position_map = &restored.position_map;
         let saved_x = position_map
             .snapshot
             .long_row(DisplayRow(0))
             .expect("a long row")
-            .x_for_column(saved_point.column);
+            .x_for_column(live_point.column);
         assert!(
             (position_map.scroll_pixel_position.x - saved_x).abs() <= 0.5,
             "{} != {saved_x}",
@@ -14062,12 +14106,7 @@ mod tests {
     fn test_anchored_block_coordinates_at_far_horizontal_scroll(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
         let column = 3_999_000;
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&"x".repeat(4_000_000), cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, cx);
-        let editor = window.root(cx).unwrap();
+        let (editor, ref mut cx) = editor_test_context(&"x".repeat(4_000_000), cx);
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
         let anchored_x = Arc::new(Mutex::new(None::<Pixels>));
         let unanchored_x = Arc::new(Mutex::new(None::<(Pixels, Pixels)>));
@@ -14134,15 +14173,23 @@ mod tests {
             editor.set_scroll_position(point(column as ScrollOffset - 10.3, 0.), window, cx);
         });
 
-        let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style)
-        });
+        let state = draw_editor(&editor, &style, cx);
         let position_map = &state.position_map;
         let expected_x = position_map.content_origin.x
             + Pixels::from(
                 position_map.line_layouts[0].x_for_index(column)
                     - position_map.scroll_pixel_position.x,
             );
+        let line = &position_map.line_layouts[0];
+        let glyph_x = painted_glyphs(line)
+            .into_iter()
+            .find_map(|(_, _, start, x, _)| (start == column).then_some(x))
+            .expect("the anchor glyph was retained");
+        assert!(position_map.scroll_pixel_position.x > 16_777_216.);
+        assert_eq!(
+            glyph_x - position_map.scroll_pixel_position.x,
+            line.x_for_index(column) - position_map.scroll_pixel_position.x
+        );
         let anchored_x = anchored_x.lock().expect("the anchored block was painted");
         assert!(
             (anchored_x - expected_x).abs() <= px(0.5),
@@ -14176,17 +14223,241 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_long_row_renderer_inlays_are_measured_once(cx: &mut TestAppContext) {
+    fn test_blocks_see_selections_outside_the_painted_columns(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
+        let (editor, ref mut cx) =
+            editor_test_context(&format!("{}\nx\n", "x".repeat(100_000)), cx);
+        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        let selected = Arc::new(Mutex::new(None::<bool>));
+        editor.update_in(cx, |editor, window, cx| {
+            let anchor = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_after(Point::new(0, 90_001));
+            let render_selected = selected.clone();
+            editor.insert_blocks(
+                [BlockProperties {
+                    style: BlockStyle::Sticky,
+                    placement: BlockPlacement::Above(anchor),
+                    height: Some(1),
+                    render: Arc::new(move |cx| {
+                        *render_selected.lock() = Some(cx.selected);
+                        div().into_any()
+                    }),
+                    priority: 0,
+                }],
+                None,
+                cx,
+            );
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([
+                    Point::new(0, 90_000)..Point::new(0, 90_002),
+                    Point::new(1, 0)..Point::new(1, 0),
+                ])
+            });
+        });
+
+        draw_editor(&editor, &style, cx);
+        assert_eq!(*selected.lock(), Some(true));
+    }
+
+    #[gpui::test]
+    fn test_renderer_inlays_are_measured_once(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for row_len in [2_000, 100] {
+            let offscreen_row = 300;
+            let window = cx.open_window(size(px(500.), px(500.)), |window, cx| {
+                let row = "x".repeat(row_len);
+                let buffer = MultiBuffer::build_simple(
+                    &format!("{row}\n").repeat(offscreen_row as usize + 1),
+                    cx,
+                );
+                Editor::new(EditorMode::full(), buffer, None, window, cx)
+            });
+            let cx = &mut VisualTestContext::from_window(*window, cx);
+            let editor = window.root(cx).unwrap();
+            let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+            let inlay_start = 60;
+            let inlay_text = "r".repeat(200);
+            editor.update(cx, |editor, cx| {
+                let buffer = editor.buffer().read(cx).snapshot(cx);
+                let inlays = [0, offscreen_row]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, row)| {
+                        let position = buffer.anchor_after(Point::new(row, inlay_start as u32));
+                        Inlay::mock_repl_result(id, position, &inlay_text)
+                    })
+                    .collect();
+                editor.splice_inlays(&[], inlays, cx);
+            });
+            cx.run_until_parked();
+            draw_editor(&editor, &style, cx);
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_scroll_position(point(inlay_start as f64 + 2., 0.), window, cx);
+            });
+            let state = draw_editor(&editor, &style, cx);
+
+            let line = &state.position_map.line_layouts[0];
+            let elements = line
+                .fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    LineFragment::Element { len, size, .. } => Some((*len, size.width)),
+                    LineFragment::Text(_) => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(elements.len(), 1, "row of {row_len}: {elements:?}");
+            let (element_len, element_width) = elements[0];
+            assert_eq!(element_len, inlay_text.len());
+            let element_left = state.content_origin.x
+                + Pixels::from(
+                    line.x_for_index(inlay_start) - state.position_map.scroll_pixel_position.x,
+                );
+            let bounds = state.position_map.text_hitbox.bounds;
+            assert!(element_left < bounds.left());
+            assert!(element_left + element_width > bounds.right());
+            assert_eq!(
+                line.x_for_index(inlay_start + inlay_text.len()) - line.x_for_index(inlay_start),
+                f64::from(element_width),
+            );
+
+            let (snapshot, details) = editor.update_in(cx, |editor, window, cx| {
+                (
+                    editor.snapshot(window, cx),
+                    editor.text_layout_details(window, cx),
+                )
+            });
+            assert!(
+                state.position_map.line_layouts.len() < offscreen_row as usize,
+                "row {offscreen_row} must stay unpainted"
+            );
+            for row in [0, offscreen_row] {
+                let row_x = |column: usize| {
+                    snapshot.x_for_display_point(
+                        DisplayPoint::new(DisplayRow(row), column as u32),
+                        &details,
+                    )
+                };
+                let inlay_width = row_x(inlay_start + inlay_text.len()) - row_x(inlay_start);
+                assert_eq!(
+                    inlay_width,
+                    f64::from(element_width),
+                    "row {row} of {row_len}"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn test_offscreen_renderer_widths_follow_layout_dimensions(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let text = format!("{}{}", "x\n".repeat(300), "x".repeat(2_000));
+        let (editor, ref mut cx) = editor_test_context(&text, cx);
+        let mut style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            let editor_handle = cx.entity().downgrade();
+            editor.display_map.update(cx, |map, _| {
+                map.fold_placeholder = FoldPlaceholder {
+                    render: Arc::new(move |_, _, _| {
+                        DimensionDependentFold(editor_handle.clone()).into_any_element()
+                    }),
+                    constrain_width: false,
+                    ..FoldPlaceholder::test()
+                };
+            });
+            editor.fold_ranges(
+                vec![Point::new(300, 1)..Point::new(300, 2)],
+                false,
+                window,
+                cx,
+            );
+        });
+
+        for (width, line_height, expected) in [
+            (500., 20., 270.),
+            (800., 20., 420.),
+            (800., 40., 440.),
+            (500., 40., 290.),
+            (500., 20., 270.),
+        ] {
+            style.text.line_height = px(line_height).into();
+            let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(width), px(500.)), |_, _| {
+                EditorElement::new(&editor, style.clone())
+            });
+            assert!(state.position_map.visible_row_range.end <= DisplayRow(300));
+            let row = state
+                .position_map
+                .snapshot
+                .long_row(DisplayRow(300))
+                .expect("an offscreen long row");
+            assert_eq!(
+                row.x_for_column(1 + "⋯".len() as u32) - row.x_for_column(1),
+                expected,
+                "editor width {width}, line height {line_height}",
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_offscreen_renderers_are_measured_within_a_per_frame_budget(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        assert_offscreen_renderers_measured_per_frame(
+            RENDERER_MEASURE_BUDGET_PER_PREPAINT / (RENDERER_VISIT_COST + RENDERER_LAYOUT_COST),
+            |id, position| Inlay::mock_repl_result(id, position, "r"),
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn test_offscreen_renderers_sharing_a_width_class_are_measured_within_a_per_frame_budget(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        assert_offscreen_renderers_measured_per_frame(
+            (RENDERER_MEASURE_BUDGET_PER_PREPAINT - RENDERER_LAYOUT_COST) / RENDERER_VISIT_COST,
+            |id, position| Inlay::color(id, position, gpui::rgba(0xff0000ff)),
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sticky_long_rows_use_measured_renderer_widths(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        update_test_editor_settings(cx, &|settings| {
+            settings.sticky_scroll = Some(settings::StickyScrollContent {
+                enabled: Some(true),
+            });
+        });
+        let header = format!("fn foo() {{ // {}", "x".repeat(1_100));
+        let text = format!("{header}\n{}}}\n", "    let one = 1;\n".repeat(40));
+        let buffer = cx.new(|cx| {
+            let mut buffer = Buffer::local(text, cx);
+            buffer.set_language(Some(languages::rust_lang()), cx);
+            buffer
+        });
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&"x".repeat(2_000), cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
+            Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
         });
         let cx = &mut VisualTestContext::from_window(*window, cx);
         let editor = window.root(cx).unwrap();
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
-        let inlay_start = 60;
-        let inlay_text = "r".repeat(200);
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            editor.refresh_sticky_headers(&snapshot.display_snapshot, cx);
+        });
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(point(0., 10.), window, cx);
+        });
+        cx.run_until_parked();
+        let inlay_start = 3;
+        let inlay_text = "rrrr";
         editor.update(cx, |editor, cx| {
             let position = editor
                 .buffer()
@@ -14195,43 +14466,30 @@ mod tests {
                 .anchor_after(MultiBufferOffset(inlay_start));
             editor.splice_inlays(
                 &[],
-                vec![Inlay::repl_result(0, position, inlay_text.as_str())],
+                vec![Inlay::mock_repl_result(0, position, inlay_text)],
                 cx,
             );
         });
-        let draw = |cx: &mut VisualTestContext| {
-            cx.run_until_parked();
-            cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-                EditorElement::new(&editor, style.clone())
-            })
-            .1
-        };
-        draw(cx);
-        let state = draw(cx);
+        cx.run_until_parked();
 
-        let line = &state.position_map.line_layouts[0];
-        let elements = line
+        let state = draw_editor(&editor, &style, cx);
+        let line = &state
+            .sticky_headers
+            .as_ref()
+            .expect("a sticky header")
+            .lines[0]
+            .line;
+        assert!(line.long_row.is_some());
+        let element_width = line
             .fragments
             .iter()
-            .filter_map(|fragment| match fragment {
-                LineFragment::Element { len, size, .. } => Some((*len, size.width)),
+            .find_map(|fragment| match fragment {
+                LineFragment::Element { size, .. } => Some(size.width),
                 LineFragment::Text(_) => None,
             })
-            .collect::<Vec<_>>();
-        assert_eq!(elements.len(), 1, "{elements:?}");
-        let (element_len, element_width) = elements[0];
-        assert_eq!(element_len, inlay_text.len());
-
-        let (snapshot, details) = editor.update_in(cx, |editor, window, cx| {
-            (
-                editor.snapshot(window, cx),
-                editor.text_layout_details(window, cx),
-            )
-        });
-        let row_x = |column: usize| {
-            snapshot.x_for_display_point(DisplayPoint::new(DisplayRow(0), column as u32), &details)
-        };
-        let inlay_width = row_x(inlay_start + inlay_text.len()) - row_x(inlay_start);
+            .expect("a rendered inlay");
+        let inlay_width =
+            line.x_for_index(inlay_start + inlay_text.len()) - line.x_for_index(inlay_start);
         assert!(
             (inlay_width - f64::from(element_width)).abs() < 0.01,
             "{inlay_width} != {element_width:?}"
@@ -14240,42 +14498,43 @@ mod tests {
 
     #[test]
     fn test_long_rows_paint_kerning_ligatures_and_styles_at_row_geometry() {
-        let mut cx = TestAppContext::build_with_text_system(
-            gpui::TestDispatcher::new(0),
-            None,
-            Arc::new(ShapingTextSystem(gpui::NoopTextSystem)),
-        );
-        init_test(&mut cx, |_| {});
-        cx.update(|cx| {
-            settings::SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.editor.minimum_contrast_for_highlights =
-                        Some(settings::MinimumContrast(106.));
-                });
-            });
+        let mut cx = shaping_test_context();
+        init_test(&mut cx, |settings| {
+            settings.defaults.show_wrap_guides = Some(true);
+            settings.defaults.wrap_guides = Some(vec![40]);
+        });
+        update_test_editor_settings(&mut cx, &|settings| {
+            settings.minimum_contrast_for_highlights = Some(settings::MinimumContrast(106.));
+            settings.scrollbar.get_or_insert_default().show = Some(settings::ShowScrollbar::Always);
         });
         let invisible_column = 30;
+        let styled_invisible_count = 5;
+        let styled_invisible_len = '\u{a0}'.len_utf8();
+        let styled_invisibles = 40..40 + styled_invisible_count * styled_invisible_len;
         let text = format!(
-            "AVA fi {}\u{200b}{}",
+            "AVA fi {}\u{200b}{}{}{}",
             "x".repeat(invisible_column - 7),
+            "x".repeat(styled_invisibles.start - invisible_column - '\u{200b}'.len_utf8()),
+            "\u{a0}".repeat(styled_invisible_count),
             "x".repeat(1_100)
         );
         let bold_columns = 10..20;
-        let italic_columns = 40..50;
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(&text, cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, &mut cx);
-        let editor = window.root(cx).unwrap();
-        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        let italic_columns = 20..30;
+        let (editor, ref mut cx) = editor_test_context(&text, &mut cx);
+        let mut style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        style.scrollbar_width = EditorElement::SCROLLBAR_WIDTH;
         editor.update(cx, |editor, cx| {
             let buffer = editor.buffer().read(cx).snapshot(cx);
-            let range = buffer.anchor_after(MultiBufferOffset(bold_columns.start))
-                ..buffer.anchor_before(MultiBufferOffset(bold_columns.end));
+            let bold_ranges = [bold_columns.clone(), styled_invisibles.clone()]
+                .into_iter()
+                .map(|columns| {
+                    buffer.anchor_after(MultiBufferOffset(columns.start))
+                        ..buffer.anchor_before(MultiBufferOffset(columns.end))
+                })
+                .collect();
             editor.highlight_text(
                 HighlightKey::Editor,
-                vec![range],
+                bold_ranges,
                 HighlightStyle {
                     font_weight: Some(FontWeight::BOLD),
                     ..HighlightStyle::default()
@@ -14300,9 +14559,7 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style.clone())
-        });
+        let state = draw_editor(&editor, &style, cx);
         let (snapshot, details) = editor.update_in(cx, |editor, window, cx| {
             (
                 editor.snapshot(window, cx),
@@ -14317,70 +14574,74 @@ mod tests {
 
         let line = &state.position_map.line_layouts[0];
         assert!(line.long_row.is_some());
-        let mut painted = Vec::new();
-        for (fragment, fragment_start, fragment_x) in line.fragment_positions() {
-            let LineFragment::Text(shaped) = fragment else {
-                continue;
-            };
-            for run in &shaped.runs {
-                for glyph in &run.glyphs {
-                    painted.push((
-                        fragment_start + glyph.index,
-                        fragment_x + f64::from(glyph.position.x),
-                        run.font_id,
-                    ));
-                }
-            }
-        }
-        for (column, x, _) in &painted {
-            assert!(
-                (x - row_x(*column)).abs() < 0.01,
-                "glyph at column {column}: {x} != {}",
-                row_x(*column)
-            );
-        }
-        let painted_x = |column: usize| {
-            painted
-                .iter()
-                .find(|(painted_column, ..)| *painted_column == column)
-                .map(|(_, x, _)| *x)
-                .expect("a glyph at the column")
-        };
-        let kerning = f64::from(ShapingTextSystem::KERNING);
-        assert!((painted_x(1) - painted_x(0) - (advance - kerning)).abs() < 0.01);
-        assert!((painted_x(2) - painted_x(1) - advance).abs() < 0.01);
-        assert!((painted_x(6) - painted_x(4) - 1.5 * advance).abs() < 0.01);
+        let text_metrics = line
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                LineFragment::Text(shaped) => Some((shaped.ascent, shaped.descent)),
+                LineFragment::Element { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let row_metrics = snapshot
+            .long_row(DisplayRow(0))
+            .expect("a long row")
+            .metrics();
         assert_eq!(
-            painted
-                .iter()
-                .filter(|(column, ..)| (4..7).contains(column))
-                .map(|(column, ..)| *column)
-                .collect::<Vec<_>>(),
-            [4, 6]
+            text_metrics,
+            vec![(row_metrics.ascent, row_metrics.descent); text_metrics.len()]
         );
-        let fonts_at = |columns: &Range<usize>| {
+        let painted = painted_glyphs(line)
+            .into_iter()
+            .map(|(font_id, _, column, x, _)| (column, x, font_id))
+            .collect::<Vec<_>>();
+        let kerning = f64::from(ShapingTextSystem::KERNING);
+        assert_eq!(
             painted
                 .iter()
-                .filter(|(column, ..)| columns.contains(column))
-                .map(|(.., font_id)| *font_id)
-                .collect::<Vec<_>>()
-        };
+                .filter(|(column, ..)| *column < 7)
+                .map(|(column, x, _)| (*column, *x))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0.),
+                (1, advance - kerning),
+                (2, 2. * advance - kerning),
+                (3, 3. * advance - kerning),
+                (4, 4. * advance - kerning),
+                (6, 5.5 * advance - kerning),
+            ]
+        );
         assert_eq!(
-            fonts_at(&bold_columns),
-            vec![ShapingTextSystem::BOLD; bold_columns.len()]
+            [row_x(5) - row_x(4), row_x(6) - row_x(5)].map(|width| (width * 100.).round() / 100.),
+            [0.75 * advance, 0.75 * advance]
         );
         let bold_extra = f64::from(ShapingTextSystem::BOLD_EXTRA);
-        assert!(
-            (painted_x(bold_columns.start + 1)
-                - painted_x(bold_columns.start)
-                - (advance + bold_extra))
-                .abs()
-                < 0.01
-        );
-        assert_eq!(
-            fonts_at(&italic_columns),
-            vec![ShapingTextSystem::ITALIC; italic_columns.len()]
-        );
+        let bold_advance = advance + bold_extra;
+        for (columns, font) in [
+            (bold_columns.clone(), ShapingTextSystem::BOLD),
+            (italic_columns, ShapingTextSystem::ITALIC),
+        ] {
+            assert_eq!(
+                painted
+                    .iter()
+                    .filter(|(column, ..)| columns.contains(column))
+                    .copied()
+                    .collect::<Vec<_>>(),
+                columns
+                    .map(|column| {
+                        (
+                            column,
+                            (column as f64 - 0.5) * advance - kerning
+                                + column
+                                    .saturating_sub(bold_columns.start)
+                                    .min(bold_columns.len())
+                                    as f64
+                                    * bold_extra,
+                            font,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
         assert_eq!(
             painted
                 .iter()
@@ -14388,6 +14649,196 @@ mod tests {
                 .count(),
             1
         );
+
+        let invisible_byte_overhead = '\u{200b}'.len_utf8() - 1;
+        let first_invisible_x =
+            (styled_invisibles.start as f64 - invisible_byte_overhead as f64 - 0.5) * advance
+                - kerning
+                + bold_columns.len() as f64 * bold_extra;
+        let expected_invisibles = (0..styled_invisible_count)
+            .map(|index| {
+                (
+                    styled_invisibles.start + index * styled_invisible_len,
+                    first_invisible_x + index as f64 * bold_advance,
+                    bold_advance,
+                )
+            })
+            .collect::<Vec<_>>();
+        for &(column, x, width) in &expected_invisibles {
+            assert_eq!(
+                [row_x(column), row_x(column + styled_invisible_len)],
+                [x, x + width],
+            );
+        }
+        let bounds = state.position_map.text_hitbox.bounds;
+        let clipped_scroll_x = first_invisible_x
+            + bold_advance / 2.
+            + f64::from(state.content_origin.x - bounds.left());
+        for scroll_x in [0., clipped_scroll_x] {
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_scroll_position(
+                    point(scroll_x / f64::from(state.position_map.em_layout_width), 0.),
+                    window,
+                    cx,
+                );
+            });
+            let state = draw_editor(&editor, &style, cx);
+            let line = &state.position_map.line_layouts[0];
+            assert_eq!(
+                line.fragment_positions()
+                    .filter(|(_, start, _)| styled_invisibles.contains(start))
+                    .map(|(fragment, start, x)| (start, x, f64::from(fragment.width())))
+                    .collect::<Vec<_>>(),
+                expected_invisibles,
+            );
+            if scroll_x > 0. {
+                let first_left = state.content_origin.x
+                    + Pixels::from(first_invisible_x - state.position_map.scroll_pixel_position.x);
+                assert!(first_left < bounds.left());
+                assert!(first_left + Pixels::from(bold_advance) > bounds.left());
+            }
+        }
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(point(0., 0.), window, cx);
+            window.focus(&editor.focus_handle(cx), cx);
+            editor.set_cursor_shape(CursorShape::Block, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                let cursor = MultiBufferOffset(bold_columns.start + 1);
+                selections.select_ranges([cursor..cursor])
+            });
+        });
+        let state = draw_editor(&editor, &style, cx);
+        let block_text_metrics = state
+            .visible_cursors
+            .iter()
+            .filter_map(|cursor| cursor.block_text.as_ref())
+            .map(|text| (text.ascent, text.descent))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            block_text_metrics,
+            [(row_metrics.ascent, row_metrics.descent)]
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(point(10., 0.), window, cx);
+        });
+        let scrolled = draw_editor(&editor, &style, cx);
+        assert_eq!(
+            scrolled.wrap_guides.as_slice(),
+            &[(
+                scrolled.content_origin.x + Pixels::from(30. * advance),
+                false
+            )]
+        );
+        cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
+            gpui::canvas(
+                move |bounds, window, cx| {
+                    EditorElement::new(&editor, style).prepaint(
+                        None,
+                        None,
+                        bounds,
+                        &mut EditorRequestLayoutState::default(),
+                        window,
+                        cx,
+                    )
+                },
+                |_, layout, _, _| {
+                    let scrollbar = layout
+                        .scrollbars_layout
+                        .as_ref()
+                        .and_then(|scrollbars| scrollbars.horizontal.as_ref())
+                        .expect("horizontal scrollbar");
+                    let thumb = scrollbar.thumb_bounds.expect("visible thumb");
+                    let remaining_travel = (layout.position_map.scroll_max.x
+                        - layout.position_map.scroll_position.x)
+                        * f64::from(scrollbar.text_unit_size);
+                    let end = thumb.right() + Pixels::from(remaining_travel);
+                    assert!((end - scrollbar.hitbox.bounds.right()).abs() <= px(1.));
+                },
+            )
+            .size_full()
+        });
+    }
+
+    #[test]
+    fn test_short_rows_paint_at_movement_geometry() {
+        let mut cx = shaping_test_context();
+        init_test(&mut cx, |_| {});
+        update_test_editor_settings(&mut cx, &|settings| {
+            settings.minimum_contrast_for_highlights = Some(settings::MinimumContrast(106.));
+        });
+        let syntax = theme::SyntaxTheme::new_test_styles([(
+            "keyword",
+            HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                ..HighlightStyle::default()
+            },
+        )]);
+        let language = languages::rust_lang();
+        language.set_theme(&syntax);
+        let text = "fn fi() {}";
+        let buffer = cx.new(|cx| {
+            let mut buffer = Buffer::local(text, cx);
+            buffer.set_language(Some(language), cx);
+            buffer
+        });
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let window = cx.add_window(|window, cx| {
+            Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, &mut cx);
+        let editor = window.root(cx).unwrap();
+        let mut style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        style.syntax = Arc::new(syntax);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(3)..MultiBufferOffset(4)])
+            });
+        });
+        cx.run_until_parked();
+        let state = draw_editor(&editor, &style, cx);
+        let (snapshot, details) = editor.update_in(cx, |editor, window, cx| {
+            (
+                editor.snapshot(window, cx),
+                editor.text_layout_details(window, cx),
+            )
+        });
+
+        let details = crate::movement::TextLayoutDetails {
+            editor_style: style.clone(),
+            ..details
+        };
+        let line = &state.position_map.line_layouts[0];
+        assert!(line.long_row.is_none());
+        let painted = painted_glyphs(line)
+            .into_iter()
+            .map(|(font_id, _, column, x, _)| (column, x, font_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            painted
+                .iter()
+                .filter(|(column, ..)| *column < 2)
+                .map(|(.., font_id)| *font_id)
+                .collect::<Vec<_>>(),
+            [ShapingTextSystem::BOLD; 2]
+        );
+        assert_eq!(
+            painted
+                .iter()
+                .filter(|(column, ..)| (3..5).contains(column))
+                .map(|(column, ..)| *column)
+                .collect::<Vec<_>>(),
+            [3]
+        );
+        for (column, x, _) in &painted {
+            let expected = snapshot
+                .x_for_display_point(DisplayPoint::new(DisplayRow(0), *column as u32), &details);
+            assert!(
+                (x - expected).abs() < 0.01,
+                "glyph at column {column}: {x} != {expected}"
+            );
+        }
     }
 
     #[test]
@@ -15639,6 +16090,345 @@ mod tests {
     }
 
     #[test]
+    fn test_bg_segments_cover_whole_ligatures() {
+        let glyph = |index: usize| gpui::ShapedGlyph {
+            id: gpui::GlyphId(0),
+            position: point(px(index as f32), px(0.)),
+            index,
+            is_emoji: false,
+        };
+        let xfix = LineLayout {
+            font_size: px(10.),
+            width: px(4.),
+            ascent: px(8.),
+            descent: px(2.),
+            runs: vec![gpui::ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![glyph(0), glyph(1), glyph(3)],
+            }],
+            len: 4,
+        };
+        let segment = |columns: Range<u32>, color: Hsla| {
+            (
+                DisplayPoint::new(DisplayRow(0), columns.start)
+                    ..DisplayPoint::new(DisplayRow(0), columns.end),
+                color,
+            )
+        };
+        let (red, blue) = (gpui::red(), gpui::blue());
+        let aligned = |segments: &[(Range<DisplayPoint>, Hsla)]| {
+            glyph_aligned_bg_segments(segments, &xfix, 10)
+        };
+
+        assert_eq!(aligned(&[segment(12..13, red)]), vec![segment(11..13, red)]);
+        assert_eq!(
+            aligned(&[segment(5..12, red), segment(12..20, blue)]),
+            vec![segment(5..13, red), segment(13..20, blue)]
+        );
+        assert_eq!(
+            aligned(&[segment(10..11, red), segment(13..14, blue)]),
+            vec![segment(10..11, red), segment(13..14, blue)]
+        );
+    }
+
+    #[test]
+    fn test_long_row_ligatures_paint_each_character_once() {
+        let mut cx = shaping_test_context();
+        init_test(&mut cx, |_| {});
+        let text = format!("x{}!", "w".repeat(1_500));
+        let (editor, ref mut cx) = editor_test_context(&text, &mut cx);
+        let mut style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        style.text.font_weight = FontWeight::NORMAL;
+        style.text.color = Hsla::black();
+        style.show_underlines = true;
+        let advance = editor.update_in(cx, |_, window, _| {
+            f64::from(style.text.font_size.to_pixels(window.rem_size()))
+                * f64::from(ShapingTextSystem::ADVANCE)
+        });
+        cx.run_until_parked();
+        for (highlight, width) in [
+            (HighlightStyle::default(), 1_127.),
+            (
+                HighlightStyle {
+                    background_color: Some(Hsla::red()),
+                    ..HighlightStyle::default()
+                },
+                1_127.,
+            ),
+            (
+                HighlightStyle {
+                    color: Some(Hsla::red()),
+                    ..HighlightStyle::default()
+                },
+                1_127.5,
+            ),
+            (
+                HighlightStyle {
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: None,
+                        wavy: false,
+                    }),
+                    ..HighlightStyle::default()
+                },
+                1_127.5,
+            ),
+            (
+                HighlightStyle {
+                    strikethrough: Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        color: None,
+                    }),
+                    ..HighlightStyle::default()
+                },
+                1_127.5,
+            ),
+        ] {
+            editor.update(cx, |editor, cx| {
+                let buffer = editor.buffer().read(cx).snapshot(cx);
+                editor.highlight_text(
+                    HighlightKey::Editor,
+                    vec![
+                        buffer.anchor_after(MultiBufferOffset(2))
+                            ..buffer.anchor_before(MultiBufferOffset(3)),
+                    ],
+                    highlight,
+                    cx,
+                );
+            });
+            let (_, state) = cx.draw(
+                point(px(0.), px(0.)),
+                size(px(20_000.), px(500.)),
+                |_, _| EditorElement::new(&editor, style.clone()),
+            );
+            let line = &state.position_map.line_layouts[0];
+            assert!(line.long_row.is_some());
+            assert_eq!(line.width, width * advance, "{highlight:?}");
+            let mut covered_end = 0;
+            let mut misplaced = Vec::new();
+            for (_, glyph, start, _, _) in painted_glyphs(line) {
+                if start != covered_end {
+                    misplaced.push((start, covered_end));
+                }
+                covered_end = start + glyph.0 as usize;
+            }
+            assert_eq!(misplaced, Vec::new());
+            assert_eq!(covered_end, text.len());
+        }
+    }
+
+    #[test]
+    fn test_styled_long_rows_match_unwindowed_shaping() {
+        let mut cx = shaping_test_context();
+        init_test(&mut cx, |_| {});
+        update_test_editor_settings(&mut cx, &|settings| {
+            settings.sticky_scroll = Some(settings::StickyScrollContent {
+                enabled: Some(true),
+            });
+        });
+        for (text, styled, oversized) in [
+            (
+                format!(
+                    "a{}",
+                    ShapingTextSystem::PRE_BASE_VOWEL.to_string().repeat(1_365)
+                ),
+                vec![997..1_060],
+                true,
+            ),
+            (
+                format!("fn foo({}: u8) {{", "漢".repeat(1_500)),
+                (0..1_500)
+                    .step_by(5)
+                    .map(|index| 7 + 3 * index..7 + 3 * (index + 2))
+                    .collect(),
+                false,
+            ),
+        ] {
+            let document = if oversized {
+                text.clone()
+            } else {
+                format!("{text}\n{}}}\n", "    let one = 1;\n".repeat(40))
+            };
+            let window = cx.open_window(size(px(500.), px(500.)), |window, cx| {
+                let buffer = MultiBuffer::build_simple(&document, cx);
+                if !oversized {
+                    buffer
+                        .read(cx)
+                        .as_singleton()
+                        .expect("a singleton buffer")
+                        .update(cx, |buffer, cx| {
+                            buffer.set_language(Some(languages::rust_lang()), cx);
+                        });
+                }
+                Editor::new(EditorMode::full(), buffer, None, window, cx)
+            });
+            let cx = &mut VisualTestContext::from_window(*window, &mut cx);
+            let editor = window.root(cx).unwrap();
+            let mut style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+            style.syntax = Arc::new(theme::SyntaxTheme::new(Vec::new()));
+
+            cx.run_until_parked();
+            let bold = HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                ..HighlightStyle::default()
+            };
+            editor.update(cx, |editor, cx| {
+                let buffer = editor.buffer().read(cx).snapshot(cx);
+                let ranges = styled
+                    .iter()
+                    .map(|columns| {
+                        buffer.anchor_after(MultiBufferOffset(columns.start))
+                            ..buffer.anchor_before(MultiBufferOffset(columns.end))
+                    })
+                    .collect();
+                editor.highlight_text(HighlightKey::Editor, ranges, bold, cx);
+            });
+            let expected = editor.update_in(cx, |_, window, _| {
+                let mut runs = Vec::new();
+                let mut start = 0;
+                for columns in &styled {
+                    if start < columns.start {
+                        runs.push(style.text.to_run(columns.start - start));
+                    }
+                    runs.push(style.text.clone().highlight(bold).to_run(columns.len()));
+                    start = columns.end;
+                }
+                runs.push(style.text.to_run(text.len() - start));
+                window.text_system().layout_line(
+                    &text,
+                    style.text.font_size.to_pixels(window.rem_size()),
+                    &runs,
+                    None,
+                )
+            });
+            let glyph_widths = editor.update_in(cx, |_, window, _| {
+                expected
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        (
+                            run.font_id,
+                            window
+                                .text_system()
+                                .bounding_box(run.font_id, expected.font_size)
+                                .size
+                                .width,
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            });
+            let scrolls = if oversized {
+                &[
+                    (TextAlign::Left, 0., 0.),
+                    (TextAlign::Left, 330., 0.),
+                    (TextAlign::Left, 350., 0.),
+                    (TextAlign::Center, 0., 0.),
+                    (TextAlign::Right, 0., 0.),
+                    (TextAlign::Left, 1_300., 0.),
+                    (TextAlign::Left, 0., 0.),
+                ][..]
+            } else {
+                &[
+                    (TextAlign::Left, 0., 0.),
+                    (TextAlign::Left, 700., 0.),
+                    (TextAlign::Center, 0., 0.),
+                    (TextAlign::Right, 0., 0.),
+                    (TextAlign::Left, 0., 10.),
+                    (TextAlign::Left, 700., 10.),
+                    (TextAlign::Center, 0., 10.),
+                    (TextAlign::Right, 0., 10.),
+                ][..]
+            };
+            for &(alignment, scroll, scroll_y) in scrolls {
+                style.text.text_align = alignment;
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.set_scroll_position(point(scroll, scroll_y), window, cx);
+                });
+                draw_editor(&editor, &style, cx);
+                cx.run_until_parked();
+                let state = draw_editor(&editor, &style, cx);
+                let line = if scroll_y == 0. {
+                    &state.position_map.line_layouts[0]
+                } else {
+                    state
+                        .sticky_headers
+                        .as_ref()
+                        .expect("a sticky header")
+                        .lines[0]
+                        .line
+                        .as_ref()
+                };
+                let viewport_origin = state.position_map.scroll_pixel_position.x
+                    + match alignment {
+                        TextAlign::Left => 0.,
+                        TextAlign::Center => {
+                            (f64::from(expected.width) - f64::from(state.content_width)) / 2.
+                        }
+                        TextAlign::Right => {
+                            f64::from(expected.width) - f64::from(state.content_width)
+                        }
+                    };
+                if oversized {
+                    assert_eq!(
+                        line.fragment_positions()
+                            .filter(|(_, _, origin)| *origin == viewport_origin)
+                            .count(),
+                        1,
+                        "alignment {alignment:?}, scroll ({scroll}, {scroll_y})"
+                    );
+                }
+                assert!(line.long_row.is_some());
+                let expected_glyphs = expected
+                    .runs
+                    .iter()
+                    .flat_map(|run| {
+                        run.glyphs.iter().map(move |glyph| {
+                            (
+                                run.font_id,
+                                glyph.id,
+                                glyph.index,
+                                Pixels::from(f64::from(glyph.position.x) - viewport_origin),
+                                glyph.position.y,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let painted = painted_glyphs(line);
+                assert!(!expected_glyphs.is_empty());
+                if !oversized {
+                    for (_, _, column, x, _) in &painted {
+                        assert!((line.x_for_index(*column) - x).abs() < 0.01);
+                    }
+                }
+                let painted = painted
+                    .into_iter()
+                    .map(|(font, glyph, column, x, y)| {
+                        (font, glyph, column, Pixels::from(x - viewport_origin), y)
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected_order = expected_glyphs.iter();
+                for glyph in &painted {
+                    assert_eq!(
+                        expected_order.find(|expected| expected.2 == glyph.2),
+                        Some(glyph),
+                        "alignment {alignment:?}, scroll ({scroll}, {scroll_y})"
+                    );
+                }
+                let visible = |glyph: &&(FontId, gpui::GlyphId, usize, Pixels, Pixels)| {
+                    let x = state.content_origin.x + glyph.3;
+                    let bounds = state.position_map.text_hitbox.bounds;
+                    x < bounds.right() && x + glyph_widths[&glyph.0] > bounds.left()
+                };
+                assert_eq!(
+                    painted.iter().filter(visible).collect::<Vec<_>>(),
+                    expected_glyphs.iter().filter(visible).collect::<Vec<_>>(),
+                    "alignment {alignment:?}, scroll ({scroll}, {scroll_y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_spacer_pattern_period() {
         // line height is smaller than target height, so we just return half the line height
         assert_eq!(EditorElement::spacer_pattern_period(10.0, 20.0), 5.0);
@@ -16038,15 +16828,195 @@ mod tests {
         assert_eq!(actual, expected, "scale: {scale}, x offset: {x_offset:?}");
     }
 
+    pub(crate) fn assert_long_row_paints(
+        editor: &Entity<Editor>,
+        style: &EditorStyle,
+        expected: &[(usize, char)],
+        cx: &mut VisualTestContext,
+    ) {
+        let state = draw_editor(editor, style, cx);
+        let line = &state.position_map.line_layouts[0];
+        assert!(line.long_row.is_some());
+        let mut actual = Vec::new();
+        for (fragment, start, _) in line.fragment_positions() {
+            let LineFragment::Text(shaped) = fragment else {
+                panic!("unexpected non-text fragment");
+            };
+            actual.extend(shaped.runs.iter().flat_map(|run| &run.glyphs).map(|glyph| {
+                (
+                    start + glyph.index,
+                    shaped.text[glyph.index..]
+                        .chars()
+                        .next()
+                        .expect("a glyph character"),
+                )
+            }));
+        }
+        assert_eq!(actual, expected);
+        assert!(line.width <= f64::from(state.position_map.text_hitbox.bounds.size.width));
+    }
+
+    struct EditorLayoutTestView {
+        element: EditorElement,
+        layout: Rc<RefCell<Option<EditorLayout>>>,
+    }
+
+    impl gpui::View for EditorLayoutTestView {
+        fn entity_id(&self) -> Option<gpui::EntityId> {
+            Some(self.element.editor.entity_id())
+        }
+
+        fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+            self
+        }
+    }
+
+    impl IntoElement for EditorLayoutTestView {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for EditorLayoutTestView {
+        type RequestLayoutState = EditorRequestLayoutState;
+        type PrepaintState = Option<EditorLayout>;
+
+        fn id(&self) -> Option<ElementId> {
+            self.element.id()
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            self.element.source_location()
+        }
+
+        fn request_layout(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector_id: Option<&gpui::InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+            self.element.request_layout(id, inspector_id, window, cx)
+        }
+
+        fn prepaint(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector_id: Option<&gpui::InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            request_layout: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            Some(
+                self.element
+                    .prepaint(id, inspector_id, bounds, request_layout, window, cx),
+            )
+        }
+
+        fn paint(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector_id: Option<&gpui::InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            request_layout: &mut Self::RequestLayoutState,
+            prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let mut layout = prepaint.take().expect("editor was prepainted");
+            self.element.paint(
+                id,
+                inspector_id,
+                bounds,
+                request_layout,
+                &mut layout,
+                window,
+                cx,
+            );
+            *self.layout.borrow_mut() = Some(layout);
+        }
+    }
+
+    #[derive(gpui::IntoElement)]
+    struct DimensionDependentFold(WeakEntity<Editor>);
+
+    impl gpui::RenderOnce for DimensionDependentFold {
+        fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+            let editor = self.0.upgrade().expect("the editor is alive");
+            let width = editor
+                .read(cx)
+                .last_bounds
+                .expect("editor bounds")
+                .size
+                .width;
+            div()
+                .w(width / 2. + window.line_height())
+                .h(window.line_height())
+        }
+    }
+
+    fn editor_test_context(
+        text: &str,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Editor>, VisualTestContext) {
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(text, cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let mut cx = VisualTestContext::from_window(*window, cx);
+        let editor = window.root(&mut cx).unwrap();
+        (editor, cx)
+    }
+
+    fn shaping_test_context() -> TestAppContext {
+        TestAppContext::build_with_text_system(
+            gpui::TestDispatcher::new(0),
+            None,
+            Arc::new(ShapingTextSystem(gpui::NoopTextSystem)),
+        )
+    }
+
+    fn painted_glyphs(
+        line: &LineWithInvisibles,
+    ) -> Vec<(FontId, gpui::GlyphId, usize, f64, Pixels)> {
+        line.fragment_positions()
+            .flat_map(|(fragment, start, x)| {
+                let runs = match fragment {
+                    LineFragment::Text(line) => line.runs.as_slice(),
+                    LineFragment::Element { .. } => &[],
+                };
+                runs.iter().flat_map(move |run| {
+                    run.glyphs.iter().map(move |glyph| {
+                        (
+                            run.font_id,
+                            glyph.id,
+                            start + glyph.index,
+                            x + f64::from(glyph.position.x),
+                            glyph.position.y,
+                        )
+                    })
+                })
+            })
+            .collect()
+    }
+
     fn draw_editor(
         editor: &Entity<Editor>,
         style: &EditorStyle,
         cx: &mut VisualTestContext,
     ) -> EditorLayout {
+        let layout = Rc::new(RefCell::new(None));
         cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(editor, style.clone())
-        })
-        .1
+            gpui::ViewElement::new(EditorLayoutTestView {
+                element: EditorElement::new(editor, style.clone()),
+                layout: layout.clone(),
+            })
+        });
+        let layout = layout.borrow_mut().take().expect("editor was painted");
+        layout
     }
 
     fn left_edge_point(state: &EditorLayout) -> Option<Point> {
@@ -16061,158 +17031,65 @@ mod tests {
         )
     }
 
+    fn assert_offscreen_renderers_measured_per_frame(
+        per_frame: usize,
+        new_inlay: impl Fn(usize, Anchor) -> Inlay,
+        cx: &mut TestAppContext,
+    ) {
+        let first_inlay_row = 300;
+        let inlay_count = per_frame + 8;
+        let (editor, ref mut cx) =
+            editor_test_context(&"xx\n".repeat(first_inlay_row + inlay_count), cx);
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx).snapshot(cx);
+            let inlays = (0..inlay_count)
+                .map(|id| {
+                    let row = (first_inlay_row + id) as u32;
+                    new_inlay(id, buffer.anchor_after(Point::new(row, 1)))
+                })
+                .collect();
+            editor.splice_inlays(&[], inlays, cx);
+        });
+        let unmeasured = |cx: &mut VisualTestContext| {
+            let snapshot = editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+            let mut count = 0;
+            snapshot.for_each_unmeasured_renderer(DisplayRow(0)..DisplayRow(0), |_, _| {
+                count += 1;
+                ControlFlow::Continue(())
+            });
+            count
+        };
+
+        let remaining = inlay_count - per_frame;
+        assert_eq!(unmeasured(cx), remaining);
+        cx.run_until_parked();
+        assert_eq!(unmeasured(cx), remaining);
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        assert_eq!(unmeasured(cx), 0);
+    }
+
     fn draw_single_row_editor(
         text: &str,
         scroll_columns: f64,
         cx: &mut TestAppContext,
-    ) -> (EditorLayout, EditorSnapshot, TextLayoutDetails) {
-        let window = cx.add_window(|window, cx| {
-            let buffer = MultiBuffer::build_simple(text, cx);
-            Editor::new(EditorMode::full(), buffer, None, window, cx)
-        });
-        let cx = &mut VisualTestContext::from_window(*window, cx);
-        let editor = window.root(cx).unwrap();
+    ) -> EditorLayout {
+        let (editor, ref mut cx) = editor_test_context(text, cx);
         let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
         editor.update_in(cx, |editor, window, cx| {
             editor.set_scroll_position(point(scroll_columns, 0.), window, cx);
         });
         cx.run_until_parked();
-        let (_, state) = cx.draw(point(px(0.), px(0.)), size(px(500.), px(500.)), |_, _| {
-            EditorElement::new(&editor, style)
-        });
-        let (snapshot, details) = editor.update_in(cx, |editor, window, cx| {
-            (
-                editor.snapshot(window, cx),
-                editor.text_layout_details(window, cx),
-            )
-        });
-        (state, snapshot, details)
+        draw_editor(&editor, &style, cx)
     }
 
-    struct ShapingTextSystem(gpui::NoopTextSystem);
-
-    impl ShapingTextSystem {
-        const ADVANCE: f32 = 0.5;
-        const KERNING: f32 = 2.;
-        const BOLD_EXTRA: f32 = 1.;
-        const REGULAR: FontId = FontId(1);
-        const BOLD: FontId = FontId(2);
-        const ITALIC: FontId = FontId(3);
-    }
-
-    impl gpui::PlatformTextSystem for ShapingTextSystem {
-        fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> anyhow::Result<()> {
-            self.0.add_fonts(fonts)
-        }
-
-        fn all_font_names(&self) -> Vec<String> {
-            self.0.all_font_names()
-        }
-
-        fn font_id(&self, descriptor: &Font) -> anyhow::Result<FontId> {
-            Ok(if descriptor.weight >= FontWeight::BOLD {
-                Self::BOLD
-            } else if descriptor.style == FontStyle::Italic {
-                Self::ITALIC
-            } else {
-                Self::REGULAR
-            })
-        }
-
-        fn font_metrics(&self, font_id: FontId) -> gpui::FontMetrics {
-            self.0.font_metrics(font_id)
-        }
-
-        fn typographic_bounds(
-            &self,
-            font_id: FontId,
-            glyph_id: GlyphId,
-        ) -> anyhow::Result<Bounds<f32>> {
-            self.0.typographic_bounds(font_id, glyph_id)
-        }
-
-        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> anyhow::Result<Size<f32>> {
-            self.0.advance(font_id, glyph_id)
-        }
-
-        fn glyph_for_char(&self, font_id: FontId, character: char) -> Option<GlyphId> {
-            self.0.glyph_for_char(font_id, character)
-        }
-
-        fn glyph_raster_bounds(
-            &self,
-            params: &gpui::RenderGlyphParams,
-        ) -> anyhow::Result<Bounds<gpui::DevicePixels>> {
-            self.0.glyph_raster_bounds(params)
-        }
-
-        fn rasterize_glyph(
-            &self,
-            params: &gpui::RenderGlyphParams,
-            raster_bounds: Bounds<gpui::DevicePixels>,
-        ) -> anyhow::Result<(Size<gpui::DevicePixels>, Vec<u8>)> {
-            self.0.rasterize_glyph(params, raster_bounds)
-        }
-
-        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[gpui::FontRun]) -> LineLayout {
-            let advance = font_size * Self::ADVANCE;
-            let mut x = px(0.);
-            let mut shaped_runs = Vec::new();
-            let mut run_start = 0;
-            for run in runs {
-                let run_text = &text[run_start..run_start + run.len];
-                let extra = if run.font_id == Self::BOLD {
-                    px(Self::BOLD_EXTRA)
-                } else {
-                    px(0.)
-                };
-                let mut glyphs = Vec::new();
-                let mut previous = None;
-                let mut characters = run_text.char_indices().peekable();
-                while let Some((index, character)) = characters.next() {
-                    if previous == Some('A') && character == 'V' {
-                        x -= px(Self::KERNING);
-                    }
-                    glyphs.push(ShapedGlyph {
-                        id: GlyphId(1),
-                        position: point(x, px(0.)),
-                        index: run_start + index,
-                        is_emoji: false,
-                    });
-                    previous = Some(character);
-                    if character == 'f'
-                        && let Some((_, ligated)) = characters.next_if(|(_, next)| *next == 'i')
-                    {
-                        previous = Some(ligated);
-                        x += advance * 1.5 + extra;
-                    } else {
-                        x += advance + extra;
-                    }
-                }
-                if !glyphs.is_empty() {
-                    shaped_runs.push(ShapedRun {
-                        font_id: run.font_id,
-                        glyphs,
-                    });
-                }
-                run_start += run.len;
-            }
-            LineLayout {
-                font_size,
-                width: x,
-                ascent: font_size * 0.8,
-                descent: font_size * -0.2,
-                runs: shaped_runs,
-                len: text.len(),
-            }
-        }
-
-        fn recommended_rendering_mode(
-            &self,
-            font_id: FontId,
-            font_size: Pixels,
-        ) -> gpui::TextRenderingMode {
-            self.0.recommended_rendering_mode(font_id, font_size)
-        }
+    fn newest_head(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Point {
+        editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head()
+        })
     }
 }

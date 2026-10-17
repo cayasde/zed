@@ -26,10 +26,7 @@ use ui::{
 use util::ResultExt;
 use workspace::{ItemHandle, ItemSettings, OpenInTerminal, OpenTerminal, RevealInProjectPanel};
 
-use super::{
-    BlockLayout, EditorElement, EditorLayout, LineWithInvisibles, layout_line,
-    render_breadcrumb_text,
-};
+use super::{BlockLayout, EditorElement, EditorLayout, LineWithInvisibles, render_breadcrumb_text};
 use crate::{
     BUFFER_HEADER_PADDING, DisplayRow, Editor, EditorSettings, EditorSnapshot, FILE_HEADER_HEIGHT,
     GutterDimensions, JumpData, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts, Point, RowExt,
@@ -39,7 +36,7 @@ use crate::{
 };
 
 pub(crate) struct StickyHeader {
-    sticky_row: DisplayRow,
+    pub(crate) sticky_row: DisplayRow,
     pub(crate) start_point: Point,
     pub(crate) offset: ScrollOffset,
 }
@@ -225,11 +222,52 @@ impl EditorElement {
         header
     }
 
-    pub(super) fn layout_sticky_headers(
+    pub(super) fn layout_sticky_header_lines(
         &self,
         snapshot: &EditorSnapshot,
         editor_width: Pixels,
+        content_width: Pixels,
+        gutter_margin: Pixels,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
+        scroll_x: ScrollPixelOffset,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<(StickyHeader, LineWithInvisibles)> {
+        Self::sticky_headers(self.editor.read(cx), snapshot)
+            .into_iter()
+            .map(|header| {
+                let rows = header.sticky_row..header.sticky_row.next_row();
+                let long_rows = snapshot.long_rows_in_view(rows.clone(), |row| {
+                    row.visible_window(
+                        scroll_x - f64::from(gutter_margin),
+                        self.style.text.text_align,
+                        f64::from(content_width),
+                    )
+                });
+                let line = Self::layout_lines(
+                    rows,
+                    snapshot,
+                    &self.style,
+                    editor_width,
+                    content_width,
+                    scroll_x,
+                    &long_rows,
+                    is_row_soft_wrapped,
+                    &[],
+                    window,
+                    cx,
+                )
+                .pop()
+                .unwrap_or_default();
+                (header, line)
+            })
+            .collect()
+    }
+
+    pub(super) fn layout_sticky_headers(
+        &self,
+        header_lines: Vec<(StickyHeader, LineWithInvisibles)>,
+        snapshot: &EditorSnapshot,
         line_height: Pixels,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         content_origin: gpui::Point<Pixels>,
@@ -245,27 +283,17 @@ impl EditorElement {
             .show_line_numbers
             .unwrap_or_else(|| EditorSettings::get_global(cx).gutter.line_numbers);
 
-        let rows = Self::sticky_headers(self.editor.read(cx), snapshot);
-
         let mut lines = Vec::<StickyHeaderLine>::new();
 
-        for StickyHeader {
-            sticky_row,
-            start_point,
-            offset,
-        } in rows.into_iter().rev()
-        {
-            let mut line = layout_line(
+        for (
+            StickyHeader {
                 sticky_row,
-                snapshot,
-                &self.style,
-                editor_width,
-                scroll_pixel_position.x,
-                is_row_soft_wrapped,
-                window,
-                cx,
-            );
-
+                start_point,
+                offset,
+            },
+            mut line,
+        ) in header_lines.into_iter().rev()
+        {
             let line_number = show_line_numbers.then(|| {
                 let start_display_row = start_point.to_display_point(snapshot).row();
                 let relative_number = relative_to
@@ -508,16 +536,13 @@ impl StickyHeaderLine {
             gutter_hitbox.origin + point(Pixels::ZERO, offset),
             size(text_hitbox.right() - gutter_hitbox.left(), line_height),
         );
-        let available_text_width =
-            (hitbox_bounds.size.width - gutter_hitbox.size.width).max(Pixels::ZERO);
-
         Self {
             row,
             offset,
             line: Rc::new(line),
             line_number,
             elements,
-            available_text_width,
+            available_text_width: text_hitbox.size.width.max(Pixels::ZERO),
             hitbox: window.insert_hitbox(hitbox_bounds, HitboxBehavior::BlockMouseExceptScroll),
         }
     }

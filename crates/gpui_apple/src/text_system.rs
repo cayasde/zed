@@ -210,7 +210,19 @@ impl PlatformTextSystem for AppleTextSystem {
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        self.0.write().layout_line(text, font_size, font_runs)
+        self.layout_line_inner(text, font_size, font_runs, None).0
+    }
+
+    fn layout_line_with_precise_positions(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+    ) -> (LineLayout, Vec<f64>, f64) {
+        let mut glyph_x_positions = Vec::new();
+        let (layout, width) =
+            self.layout_line_inner(text, font_size, font_runs, Some(&mut glyph_x_positions));
+        (layout, glyph_x_positions, width)
     }
 
     fn recommended_rendering_mode(
@@ -536,8 +548,16 @@ impl AppleTextSystemState {
             Ok((bitmap_size, bytes))
         }
     }
+}
 
-    fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+impl AppleTextSystem {
+    fn layout_line_inner(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+        mut glyph_x_positions: Option<&mut Vec<f64>>,
+    ) -> (LineLayout, f64) {
         // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
@@ -557,7 +577,7 @@ impl AppleTextSystemState {
 
                 let length = utf16_end - utf16_start;
                 let cf_range = CFRange::init(utf16_start, length);
-                let font = &self.fonts[run.font_id.0];
+                let font = self.0.read().fonts[run.font_id.0].clone();
 
                 let font_metrics = font.metrics();
                 let font_scale = f32::from(font_size) / font_metrics.units_per_em as f32;
@@ -592,8 +612,21 @@ impl AppleTextSystemState {
                     .downcast::<CTFont>()
                     .unwrap()
             };
-            let font_id = self.id_for_native_font(font);
+            let postscript_name = font.postscript_name();
+            let (font_id, is_emoji) = {
+                let state = self.0.upgradable_read();
+                if let Some(&font_id) = state.font_ids_by_postscript_name.get(&postscript_name) {
+                    (font_id, state.is_emoji(font_id))
+                } else {
+                    let mut state = RwLockUpgradableReadGuard::upgrade(state);
+                    let font_id = state.id_for_native_font(font);
+                    (font_id, state.is_emoji(font_id))
+                }
+            };
 
+            if let Some(glyph_x_positions) = glyph_x_positions.as_mut() {
+                glyph_x_positions.reserve(run.glyph_count().try_into().unwrap_or(0));
+            }
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id => &mut run.glyphs,
                 _ => {
@@ -611,28 +644,30 @@ impl AppleTextSystemState {
                 .zip(run.string_indices().iter())
             {
                 let glyph_utf16_ix = usize::try_from(glyph_utf16_ix).unwrap();
-                if ix_converter.utf16_ix > glyph_utf16_ix {
-                    // We cannot reuse current index converter, as it can only seek forward. Restart the search.
-                    ix_converter = StringIndexConverter::new(text);
-                }
                 ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
+                if let Some(glyph_x_positions) = glyph_x_positions.as_mut() {
+                    glyph_x_positions.push(position.x);
+                }
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
                     position: point(position.x as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
-                    is_emoji: self.is_emoji(font_id),
+                    is_emoji,
                 });
             }
         }
         let typographic_bounds = line.get_typographic_bounds();
-        LineLayout {
-            runs,
-            font_size,
-            width: typographic_bounds.width.into(),
-            ascent: max_ascent.into(),
-            descent: max_descent.into(),
-            len: text.len(),
-        }
+        (
+            LineLayout {
+                runs,
+                font_size,
+                width: typographic_bounds.width.into(),
+                ascent: max_ascent.into(),
+                descent: max_descent.into(),
+                len: text.len(),
+            },
+            typographic_bounds.width,
+        )
     }
 }
 
@@ -643,6 +678,7 @@ struct StringIndexConverter<'a> {
     utf8_ix: usize,
     /// Index in UTF-16 code units
     utf16_ix: usize,
+    utf8_indices: Option<Vec<usize>>,
 }
 
 impl<'a> StringIndexConverter<'a> {
@@ -651,10 +687,30 @@ impl<'a> StringIndexConverter<'a> {
             text,
             utf8_ix: 0,
             utf16_ix: 0,
+            utf8_indices: None,
         }
     }
 
     fn advance_to_utf16_ix(&mut self, utf16_target: usize) {
+        if self.utf16_ix > utf16_target && self.utf8_indices.is_none() {
+            let mut indices = Vec::with_capacity(self.text.encode_utf16().count() + 1);
+            indices.push(0);
+            for (offset, character) in self.text.char_indices() {
+                indices.extend(std::iter::repeat_n(
+                    offset + character.len_utf8(),
+                    character.len_utf16(),
+                ));
+            }
+            self.utf8_indices = Some(indices);
+        }
+        if let Some(indices) = &self.utf8_indices {
+            self.utf8_ix = indices
+                .get(utf16_target)
+                .copied()
+                .unwrap_or(self.text.len());
+            self.utf16_ix = utf16_target;
+            return;
+        }
         for (ix, c) in self.text[self.utf8_ix..].char_indices() {
             if self.utf16_ix >= utf16_target {
                 self.utf8_ix += ix;
@@ -774,7 +830,8 @@ mod lenient_font_attributes {
 
 #[cfg(test)]
 mod tests {
-    use crate::AppleTextSystem;
+    use super::{AppleTextSystem, StringIndexConverter};
+    use core_text::font_descriptor::kCTFontOrientationHorizontal;
     use gpui::{FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, font, px};
     use std::sync::Arc;
 
@@ -799,6 +856,46 @@ mod tests {
         );
         assert_eq!(layout.len, 6);
         assert!(!layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_layout_line_with_precise_positions() {
+        let fonts = AppleTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        let glyph_id = fonts.glyph_for_char(font_id, 'm').unwrap().0 as u16;
+        for font_size in [16.0f32, 16_777_216.0] {
+            let native_font = fonts.0.read().fonts[font_id.0]
+                .native_font()
+                .clone_with_font_size(f64::from(font_size.next_up()));
+            let advance = unsafe {
+                native_font.get_advances_for_glyphs(
+                    kCTFontOrientationHorizontal,
+                    &glyph_id,
+                    std::ptr::null_mut(),
+                    1,
+                )
+            };
+            let (layout, positions, width) = fonts.layout_line_with_precise_positions(
+                "mmmm",
+                px(font_size),
+                &[FontRun { font_id, len: 4 }],
+            );
+            assert_eq!(positions, [0., advance, advance * 2., advance * 3.]);
+            assert_eq!(width, advance * 4.);
+            assert_ne!(width, f64::from(layout.width));
+        }
+    }
+
+    #[test]
+    fn test_reordered_string_indices() {
+        let text = "😀किa".repeat(1_024);
+        let mut converter = StringIndexConverter::new(&text);
+        for repetition in 0..1_024 {
+            for (utf16, utf8) in [(0, 0), (3, 7), (2, 4), (1, 4), (4, 10), (5, 11)] {
+                converter.advance_to_utf16_ix(repetition * 5 + utf16);
+                assert_eq!(converter.utf8_ix, repetition * 11 + utf8);
+            }
+        }
     }
 
     #[test]
