@@ -14893,6 +14893,7 @@ name = "recent_projects"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "askpass",
  "chrono",
  "db",
  "dev_container",
@@ -15106,7 +15107,6 @@ dependencies = [
  "log",
  "markdown",
  "menu",
- "parking_lot",
  "release_channel",
  "remote",
  "semver",
@@ -22056,6 +22056,7 @@ dependencies = [
  "agent_settings",
  "any_vec",
  "anyhow",
+ "async-recursion",
  "chrono",
  "client",
  "clock",
