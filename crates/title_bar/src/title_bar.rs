@@ -224,6 +224,13 @@ pub struct TitleBar {
 
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if cfg!(target_os = "windows")
+            && (window.is_fullscreen() || window.is_simple_fullscreen())
+            && !TitleBarSettings::get_global(cx).show_in_fullscreen
+        {
+            return div().into_any_element();
+        }
+
         if self.multi_workspace.is_none() {
             if let Some(mw) = self
                 .workspace
