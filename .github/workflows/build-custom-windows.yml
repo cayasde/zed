@@ -1,0 +1,76 @@
+name: Build custom Zed for Windows
+
+on:
+  push:
+    branches: [hide-title-bar-in-fullscreen]
+    paths:
+      - .github/workflows/build-custom-windows.yml
+      - assets/settings/default.json
+      - crates/settings_content/src/title_bar.rs
+      - crates/settings_ui/src/page_data.rs
+      - crates/title_bar/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 180
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+      CARGO_TARGET_DIR: C:\zed-build
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      RELEASE_CHANNEL: stable
+      ZED_RELEASE_CHANNEL: stable
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install Rust
+        shell: pwsh
+        run: rustup toolchain install 1.98.1 --profile minimal
+
+      - name: Build Zed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $visualStudioPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $visualStudioPath) { throw 'Visual C++ build tools were not found.' }
+          & "$visualStudioPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Free, Used
+          cargo build --release --locked --package zed
+          & "$env:CARGO_TARGET_DIR\release\zed.exe" --version
+
+      - name: Package executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path custom-zed -Force
+          Copy-Item -LiteralPath "$env:CARGO_TARGET_DIR\release\zed.exe" -Destination custom-zed\Zed.exe
+          foreach ($fileName in @('conpty.dll', 'OpenConsole.exe')) {
+            $filePath = Join-Path "$env:CARGO_TARGET_DIR\release" $fileName
+            if (Test-Path -LiteralPath $filePath) {
+              Copy-Item -LiteralPath $filePath -Destination custom-zed
+            }
+          }
+          git rev-parse HEAD | Set-Content -Path custom-zed\commit.txt
+          Get-FileHash custom-zed\Zed.exe -Algorithm SHA256 | Format-List
+
+      - name: Upload executable
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: zed-custom-windows-x64
+          path: custom-zed/
+          if-no-files-found: error
+          retention-days: 14
